@@ -1,0 +1,17 @@
+{
+  "name": "zelva-agent",
+  "version": "1.0.0",
+  "description": "ZELVA Agent — scraper local sin APIs usando Playwright",
+  "type": "module",
+  "scripts": {
+    "start": "tsx server.ts",
+    "scan": "tsx scan.ts",
+    "setup": "tsx src/setup-auth.ts",
+    "install-browsers": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "playwright": "^1.48.0",
+    "tsx": "^4.19.2"
+  }
+}

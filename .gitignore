@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Environment (API keys, credentials — NO subir)
+.env
+
+# Auth cookies de Playwright (sesiones reales — NO subir)
+auth/
+
+# Output en tiempo de ejecucion
+results/
+screenshots/
+
+# Debug images
+debug_*.png
+debug_*.jpg
+
+# TypeScript compiled
+dist/
+*.js.map
+
+# OS
+.DS_Store
+Thumbs.db
