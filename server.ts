@@ -729,7 +729,7 @@ async function runScanPartial(keyword: string, pills?: string[], days = 7, exclu
 function cors(res: http.ServerResponse) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, ngrok-skip-browser-warning');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, ngrok-skip-browser-warning, x-agent-key');
 }
 
 function json(res: http.ServerResponse, data: unknown, code = 200) {
