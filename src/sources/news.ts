@@ -43,8 +43,13 @@ async function fetchGoogleSearchNews(keyword: string, days: number, ctx: any): P
       // En vez de partir del link y adivinar hasta dónde subir, partimos del texto
       // de fecha ("hace X horas/días") — corto, distintivo y siempre presente —
       // y desde ahí buscamos el heading y el link más cercanos hacia arriba.
+      // IMPORTANTE: acotado a #search/#rso (el contenedor real de resultados) —
+      // sin esto, si Google no tiene noticias y muestra otra cosa en la misma
+      // página (carruseles de video, "quizás quiso decir"), se recogía texto
+      // con fecha de CUALQUIER lado, sin relación con la búsqueda.
+      const root = document.querySelector('#rso') || document.querySelector('#search') || document.body;
       const dateEls: Element[] = [];
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
       let cur = walker.nextNode() as Element | null;
       while (cur) {
         const ownText = (cur.textContent || '').trim();
@@ -78,8 +83,22 @@ async function fetchGoogleSearchNews(keyword: string, days: number, ctx: any): P
       return out.slice(0, 20);
     });
 
+    // Relevancia — descarta resultados que no mencionan ninguno de los términos
+    // buscados. Sin esto, si Google no encontró noticias reales y la página
+    // terminó mostrando otra cosa (sonidos de TikTok, videos, etc.), esos
+    // resultados irrelevantes se colaban igual como si fueran "noticias".
+    const DIACRITICS = new RegExp('[\\u0300-\\u036f]', 'g');
+    const kwTerms = keyword.replace(/"/g, '').toLowerCase()
+      .normalize('NFD').replace(DIACRITICS, '')
+      .split(/\s+/).filter(w => w.length >= 3);
+
     let undated = 0;
     for (const item of items) {
+      const titleNorm = item.title.toLowerCase().normalize('NFD').replace(DIACRITICS, '');
+      const urlNorm = item.url.toLowerCase();
+      const isRelevant = kwTerms.length === 0 || kwTerms.some(w => titleNorm.includes(w) || urlNorm.includes(w));
+      if (!isRelevant) continue;
+
       if (!item.time) undated++;
       const date = item.time ? parseRelativeDate(item.time) : new Date().toISOString();
       if (!isRecent(date, days)) continue;
