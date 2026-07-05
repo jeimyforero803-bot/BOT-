@@ -3,7 +3,7 @@
  */
 import {
   getContext, hasAuth, humanDelay, humanScroll,
-  takeScreenshot, waitForComments, parseRelativeDate, isRecent, delay,
+  takeScreenshot, waitForComments, parseRelativeDate, isRecent, delay, buildPreciseQuery,
 } from '../browser.js';
 import type { Mention, Comment, Etiquetado } from '../types.js';
 
@@ -22,8 +22,13 @@ export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], 
     if (useAuth) {
       console.log('[Twitter] Usando sesión guardada...');
 
+      // Frase exacta en vez de "keyword" suelto — evita traer cualquier tweet
+      // que solo contenga una palabra del nombre de marca (falsos positivos).
+      const preciseQuery = buildPreciseQuery(keyword, extraTerms);
+      console.log(`[Twitter] Búsqueda precisa: ${preciseQuery}`);
+
       // Goto con retry automático — si falla espera 4s y reintenta
-      const twSearchUrl = `https://twitter.com/search?q=${encodeURIComponent(keyword)}&src=typed_query&f=live`;
+      const twSearchUrl = `https://twitter.com/search?q=${encodeURIComponent(preciseQuery)}&src=typed_query&f=live`;
       let twLoaded = false;
       for (let attempt = 0; attempt < 2 && !twLoaded; attempt++) {
         try {
@@ -37,7 +42,7 @@ export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], 
       const found = await waitForComments(page, '[data-testid="tweet"]', 2, 45000);
       if (!found) {
         await page.goto(
-          `https://twitter.com/search?q=${encodeURIComponent(keyword)}&src=typed_query`,
+          `https://twitter.com/search?q=${encodeURIComponent(preciseQuery)}&src=typed_query`,
           { waitUntil: 'domcontentloaded', timeout: 60000 }
         );
         await waitForComments(page, '[data-testid="tweet"]', 1, 45000);
@@ -136,7 +141,7 @@ export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], 
 
       // Segunda pasada: buscar tweets recientes con since:
       const sinceDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-      const recentUrl = `https://twitter.com/search?q=${encodeURIComponent(keyword + ` since:${sinceDate}`)}&src=typed_query&f=live`;
+      const recentUrl = `https://twitter.com/search?q=${encodeURIComponent(preciseQuery + ` since:${sinceDate}`)}&src=typed_query&f=live`;
       try {
         await page.goto(recentUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
         const recentFound = await waitForComments(page, '[data-testid="tweet"]', 2, 30000);

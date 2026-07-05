@@ -4,7 +4,7 @@
  */
 import {
   getContext, hasAuth, humanDelay, humanScroll,
-  takeScreenshot, waitForComments, parseRelativeDate, isRecent, delay,
+  takeScreenshot, waitForComments, parseRelativeDate, isRecent, delay, buildPreciseQuery,
 } from '../browser.js';
 import type { Mention, Comment, Etiquetado } from '../types.js';
 
@@ -118,7 +118,7 @@ async function extractReplies(page: any, mainText: string): Promise<{
   }, mainText);
 }
 
-export async function scrapeThreads(keyword: string, _extraTerms: string[] = [], days = 30): Promise<{
+export async function scrapeThreads(keyword: string, extraTerms: string[] = [], days = 30): Promise<{
   mentions: Mention[]; comments: Comment[]; etiquetados: Etiquetado[];
 }> {
   const mentions: Mention[] = [];
@@ -131,17 +131,18 @@ export async function scrapeThreads(keyword: string, _extraTerms: string[] = [],
   }
 
   const ctx = await getContext('threads');
+  const preciseQuery = buildPreciseQuery(keyword, extraTerms);
 
   try {
     const page = await ctx.newPage();
-    console.log(`[Threads] Buscando "${keyword}"...`);
+    console.log(`[Threads] Buscando "${preciseQuery}"...`);
 
     // threads.com (nuevo dominio). filter=recent = pestaña "Recientes"
     // URL confirmada: threads.com/search?q=keyword&serp_type=default&filter=recent
     const searchUrls = [
-      `https://www.threads.com/search?q=${encodeURIComponent(keyword)}&serp_type=default&filter=recent`,
-      `https://www.threads.com/search?q=${encodeURIComponent(keyword)}&serp_type=default`,
-      `https://www.threads.com/search?q=${encodeURIComponent(keyword)}`,
+      `https://www.threads.com/search?q=${encodeURIComponent(preciseQuery)}&serp_type=default&filter=recent`,
+      `https://www.threads.com/search?q=${encodeURIComponent(preciseQuery)}&serp_type=default`,
+      `https://www.threads.com/search?q=${encodeURIComponent(preciseQuery)}`,
     ];
 
     let loaded = false;
@@ -284,7 +285,7 @@ export async function scrapeThreads(keyword: string, _extraTerms: string[] = [],
         platform: 'threads',
         author: post.author,
         text: post.text.slice(0, 600),
-        url: post.url || `https://www.threads.com/search?q=${encodeURIComponent(keyword)}`,
+        url: post.url || `https://www.threads.com/search?q=${encodeURIComponent(preciseQuery)}`,
         date: isoDate,
         tipo: 'post',
         screenshot: shot,

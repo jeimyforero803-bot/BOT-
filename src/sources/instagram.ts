@@ -3,7 +3,7 @@
  */
 import {
   getContext, hasAuth, humanDelay, humanScroll,
-  takeScreenshot, waitForComments, parseRelativeDate, isRecent, delay,
+  takeScreenshot, waitForComments, parseRelativeDate, isRecent, delay, buildPreciseQuery,
 } from '../browser.js';
 import type { Mention, Comment, Etiquetado } from '../types.js';
 
@@ -56,12 +56,14 @@ export async function scrapeInstagram(keyword: string, extraTerms: string[] = []
     let postLinks = await extractPostLinks();
     console.log(`[Instagram] ${postLinks.length} posts en #${hashtag}`);
 
-    // Si hay pocos posts en el hashtag, buscar también por keyword directamente
+    // Si hay pocos posts en el hashtag, buscar también por la frase exacta de la
+    // marca (no solo "keyword" suelto, que puede venir recortado a una palabra).
     if (postLinks.length < 4) {
-      console.log('[Instagram] Pocos posts en hashtag, buscando por keyword...');
+      const preciseQuery = buildPreciseQuery(keyword, extraTerms);
+      console.log(`[Instagram] Pocos posts en hashtag, buscando "${preciseQuery}"...`);
       try {
         await page.goto(
-          `https://www.instagram.com/explore/search/keyword/?q=${encodeURIComponent(keyword)}`,
+          `https://www.instagram.com/explore/search/keyword/?q=${encodeURIComponent(preciseQuery)}`,
           { waitUntil: 'domcontentloaded', timeout: 20000 }
         );
         await delay(3000);

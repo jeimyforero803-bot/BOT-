@@ -221,3 +221,18 @@ export function isRecent(isoDate: string, days = 45): boolean {
     return true;
   }
 }
+
+/**
+ * Reconstruye la frase completa de la marca a partir de `keyword` (el término
+ * "base" que ya puede venir recortado si el usuario escribió la marca como
+ * varios pills sueltos) + `extraTerms`, y la devuelve entre comillas para que
+ * el buscador del sitio la trate como frase exacta en vez de palabras sueltas
+ * — así "Tarrito" + "Rojo" busca "Tarrito Rojo" y no cualquier cosa con "Tarrito".
+ */
+export function buildPreciseQuery(keyword: string, extraTerms: string[] = []): string {
+  const plainExtras = extraTerms.filter(t =>
+    !t.startsWith('@') && !t.startsWith('#') && t.toLowerCase() !== keyword.toLowerCase()
+  );
+  const full = [keyword, ...plainExtras].join(' ').trim();
+  return full.includes(' ') ? `"${full}"` : full;
+}

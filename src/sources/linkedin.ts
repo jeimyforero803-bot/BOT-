@@ -5,7 +5,7 @@
  */
 import {
   getContext, hasAuth, humanDelay, humanScroll,
-  takeScreenshot, waitForComments, parseRelativeDate, isRecent, delay,
+  takeScreenshot, waitForComments, parseRelativeDate, isRecent, delay, buildPreciseQuery,
 } from '../browser.js';
 import type { Mention, Comment, Etiquetado } from '../types.js';
 
@@ -189,7 +189,7 @@ async function extractComments(page: any): Promise<{
   });
 }
 
-export async function scrapeLinkedIn(keyword: string, _extraTerms: string[] = [], days = 30, exclusions: string[] = []): Promise<{
+export async function scrapeLinkedIn(keyword: string, extraTerms: string[] = [], days = 30, exclusions: string[] = []): Promise<{
   mentions: Mention[]; comments: Comment[]; etiquetados: Etiquetado[];
 }> {
   const mentions: Mention[] = [];
@@ -212,11 +212,12 @@ export async function scrapeLinkedIn(keyword: string, _extraTerms: string[] = []
 
   try {
     const page = await ctx.newPage();
-    console.log(`[LinkedIn] Buscando "${keyword}" (${dateFilter || 'sin filtro fecha'})...`);
+    const preciseQuery = buildPreciseQuery(keyword, extraTerms);
+    console.log(`[LinkedIn] Buscando "${preciseQuery}" (${dateFilter || 'sin filtro fecha'})...`);
 
     // LinkedIn requiere comillas literales en sortBy y datePosted (%22 = ")
     // /content/ = Publicaciones; sortBy="date_posted"; datePosted="past-week"
-    const enc = encodeURIComponent(keyword);
+    const enc = encodeURIComponent(preciseQuery);
     const searchUrls = [
       dateFilter
         ? `https://www.linkedin.com/search/results/content/?keywords=${enc}&sortBy=%22date_posted%22&datePosted=%22${dateFilter}%22`
