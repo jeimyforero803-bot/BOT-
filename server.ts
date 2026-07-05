@@ -12,6 +12,7 @@
  */
 import 'dotenv/config';
 import http from 'http';
+import { spawn, type ChildProcess } from 'child_process';
 import { scrapeYouTube } from './src/sources/youtube.js';
 import { scrapeReddit } from './src/sources/reddit.js';
 import { scrapeNews } from './src/sources/news.js';
@@ -752,6 +753,13 @@ const server = http.createServer(async (req, res) => {
 
   if (method === 'OPTIONS') { cors(res); res.writeHead(204); res.end(); return; }
 
+  // Autenticación — obligatoria si AGENT_KEY está configurada (necesario en cuanto
+  // el puerto queda expuesto a internet vía túnel; sin esto cualquiera podría
+  // disparar scans, borrar el historial o leer resultados).
+  if (AGENT_KEY && req.headers['x-agent-key'] !== AGENT_KEY) {
+    return json(res, { error: 'unauthorized' }, 401);
+  }
+
   // GET /status
   if (method === 'GET' && url === '/status') {
     return json(res, {
@@ -865,11 +873,64 @@ const server = http.createServer(async (req, res) => {
   json(res, { error: 'Not found' }, 404);
 });
 
+// ─── Quick Tunnel — expone el agente en internet sin necesitar un dominio propio ──
+// Sin dominio en Cloudflare no hay hostname público estable, así que en vez de fijar
+// una URL, el agente lanza un Quick Tunnel (URL aleatoria *.trycloudflare.com), la
+// detecta en el output de cloudflared y la reporta al backend. El backend guarda
+// "la URL vigente" y el frontend la consulta en caliente — si el proceso se reinicia
+// y la URL cambia, se auto-corrige sin tocar código ni redeploys.
+const CLOUDFLARED_PATH = process.env.CLOUDFLARED_PATH || 'C:\\Program Files (x86)\\cloudflared\\cloudflared.exe';
+const TUNNEL_URL_REGEX = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/;
+let tunnelProc: ChildProcess | null = null;
+let currentTunnelUrl = '';
+
+async function registerTunnelUrl(url: string) {
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/agent/register-url`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(AGENT_KEY ? { 'x-agent-key': AGENT_KEY } : {}) },
+      body: JSON.stringify({ url }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (res.ok) console.log(`[Tunnel] ✅ URL registrada en el backend: ${url}`);
+    else console.warn(`[Tunnel] ⚠️ Backend rechazó el registro (${res.status})`);
+  } catch (e: any) {
+    console.warn('[Tunnel] ⚠️ No se pudo registrar la URL en el backend:', e.message);
+  }
+}
+
+function startQuickTunnel() {
+  tunnelProc = spawn(CLOUDFLARED_PATH, ['tunnel', '--url', `http://localhost:${PORT}`, '--no-autoupdate'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  const onOutput = (chunk: Buffer) => {
+    const match = chunk.toString().match(TUNNEL_URL_REGEX);
+    if (match && match[0] !== currentTunnelUrl) {
+      currentTunnelUrl = match[0];
+      console.log(`[Tunnel] 🌐 URL pública detectada: ${currentTunnelUrl}`);
+      registerTunnelUrl(currentTunnelUrl);
+    }
+  };
+  tunnelProc.stdout?.on('data', onOutput);
+  tunnelProc.stderr?.on('data', onOutput); // cloudflared loguea por stderr
+
+  tunnelProc.on('exit', (code) => {
+    console.warn(`[Tunnel] cloudflared salió (código ${code}) — reintentando en 5s...`);
+    currentTunnelUrl = '';
+    setTimeout(startQuickTunnel, 5000);
+  });
+}
+
+// Re-registrar cada 6h mientras el proceso vive, por si el TTL del backend expira
+setInterval(() => { if (currentTunnelUrl) registerTunnelUrl(currentTunnelUrl); }, 6 * 60 * 60 * 1000);
+
 // Sin timeout en el servidor — los scans pueden tardar hasta 2 horas
 server.timeout = 0;
 server.keepAliveTimeout = 7_200_000; // 2 horas
 
 server.listen(PORT, () => {
+  startQuickTunnel();
   console.log(`
 ╔══════════════════════════════════════════╗
 ║        ZELVA Agent — Servidor Local      ║
@@ -897,6 +958,8 @@ server.on('error', (e: any) => {
 
 process.on('SIGINT', async () => {
   console.log('\nDeteniendo agente...');
+  tunnelProc?.removeAllListeners('exit');
+  tunnelProc?.kill();
   await closeBrowser();
   server.close();
   process.exit(0);
