@@ -42,6 +42,19 @@ let currentKeyword = '';
 let lastResult: ScanPayload | null = null;
 let lastError = '';
 let scanStartedAt = '';
+let stopRequested = false;
+
+// Filtro de rango de fecha exacto — aplicado DESPUÉS de que los scrapers ya
+// buscaron con su ventana `days` habitual (que sigue usándose para acotar cuánto
+// buscan hacia atrás), para recortar al rango preciso pedido por el usuario.
+function inExactRange(dateStr: string, start?: string, end?: string): boolean {
+  if (!start && !end) return true;
+  const t = new Date(dateStr).getTime();
+  if (isNaN(t)) return true; // sin fecha parseable, no descartar
+  if (start && t < new Date(start).getTime()) return false;
+  if (end && t > new Date(end + 'T23:59:59.999').getTime()) return false;
+  return true;
+}
 
 // ─── URLs ya vistas (persiste entre scans, por keyword) ───────────────────────
 const SEEN_FILE = path.join(process.cwd(), 'results', 'seen_urls.json');
@@ -308,10 +321,11 @@ function buildDailyReport(
 }
 
 // ─── Escaneo principal ────────────────────────────────────────────────────────
-async function runScan(keyword: string, pills?: string[], days = 30, exclusions: string[] = [], selectedPlatforms: string[] = []): Promise<void> {
+async function runScan(keyword: string, pills?: string[], days = 30, exclusions: string[] = [], selectedPlatforms: string[] = [], dateRange?: { start?: string; end?: string }): Promise<void> {
   status = 'running';
   currentKeyword = keyword;
   scanStartedAt = new Date().toISOString();
+  stopRequested = false;
 
   const { base: baseKeyword, extraTerms } = parseSearchTerms(keyword, pills);
   const displayKeyword = keyword; // nombre para mostrar al usuario (todos los pills)
@@ -390,21 +404,34 @@ async function runScan(keyword: string, pills?: string[], days = 30, exclusions:
     const active = selectedPlatforms.length > 0 ? selectedPlatforms : ['twitter','youtube','noticias','instagram','reddit','facebook','linkedin','threads','tiktok'];
     const run = (key: string, scraper: Scraper) => active.includes(key) ? runScraper(key, scraper) : Promise.resolve();
 
-    // Ejecutar en 3 batches para evitar saturación de red/CPU/memoria
-    // Batch 1: las fuentes más pesadas (video + texto largo)
+    // Ejecutar en 3 batches para evitar saturación de red/CPU/memoria.
+    // Entre cada batch se revisa stopRequested — si el usuario le dio "Detener",
+    // no se lanzan más batches (el actual ya fue interrumpido por closeBrowser()
+    // en el endpoint /stop, así que sus scrapers ya están fallando/retornando).
     const b1 = [run('twitter', scrapeTwitter as Scraper), run('youtube', scrapeYouTube as Scraper), run('noticias', scrapeNews as Scraper)].filter(Boolean);
     if (b1.length) { console.log('🔄 Batch 1: Twitter, YouTube, Noticias'); await Promise.all(b1); }
 
-    // Batch 2: redes sociales con sesión
-    const b2 = [run('instagram', scrapeInstagram as Scraper), run('reddit', scrapeReddit as Scraper)].filter(Boolean);
-    if (b2.length) { console.log('🔄 Batch 2: Instagram, Reddit'); await Promise.all(b2); }
+    if (!stopRequested) {
+      // Batch 2: redes sociales con sesión
+      const b2 = [run('instagram', scrapeInstagram as Scraper), run('reddit', scrapeReddit as Scraper)].filter(Boolean);
+      if (b2.length) { console.log('🔄 Batch 2: Instagram, Reddit'); await Promise.all(b2); }
+    }
 
-    // Batch 3: Facebook, LinkedIn, Threads
-    const b3 = [run('facebook', scrapeFacebook as Scraper), run('linkedin', scrapeLinkedIn as Scraper), run('threads', scrapeThreads as Scraper)].filter(Boolean);
-    if (b3.length) { console.log('🔄 Batch 3: Facebook, LinkedIn, Threads'); await Promise.all(b3); }
+    if (!stopRequested) {
+      // Batch 3: Facebook, LinkedIn, Threads
+      const b3 = [run('facebook', scrapeFacebook as Scraper), run('linkedin', scrapeLinkedIn as Scraper), run('threads', scrapeThreads as Scraper)].filter(Boolean);
+      if (b3.length) { console.log('🔄 Batch 3: Facebook, LinkedIn, Threads'); await Promise.all(b3); }
+    }
 
     // Batch 4: TikTok al final
-    if (active.includes('tiktok')) { console.log('🔄 Batch 4: TikTok'); await runScraper('tiktok', scrapeTikTok as Scraper); }
+    if (!stopRequested && active.includes('tiktok')) { console.log('🔄 Batch 4: TikTok'); await runScraper('tiktok', scrapeTikTok as Scraper); }
+
+    if (stopRequested) {
+      console.log('[Scan] Detenido manualmente por el usuario.');
+      status = 'error';
+      lastError = 'Escaneo detenido manualmente.';
+      return;
+    }
 
     // Filtrar por autor Y por contenido de texto
     // - Términos con @ → solo comparan contra el autor
@@ -439,6 +466,17 @@ async function runScan(keyword: string, pills?: string[], days = 30, exclusions:
         allMentions.length = 0; allMentions.push(...keepM);
         allComments.length = 0; allComments.push(...keepC);
       }
+    }
+
+    // ── Rango de fecha exacto (si el usuario eligió fecha/rango específico) ──
+    if (dateRange?.start || dateRange?.end) {
+      const beforeM2 = allMentions.length, beforeC2 = allComments.length;
+      const keepM2 = allMentions.filter(m => inExactRange(m.date, dateRange.start, dateRange.end));
+      const keepC2 = allComments.filter(c => inExactRange(c.date, dateRange.start, dateRange.end));
+      allMentions.length = 0; allMentions.push(...keepM2);
+      allComments.length = 0; allComments.push(...keepC2);
+      allEtiquetados.splice(0, allEtiquetados.length, ...allEtiquetados.filter(e => inExactRange(e.date, dateRange.start, dateRange.end)));
+      console.log(`[Fecha] Rango ${dateRange.start || '…'} a ${dateRange.end || '…'}: ${beforeM2}→${keepM2.length}m, ${beforeC2}→${keepC2.length}c`);
     }
 
     // ── Dedup contra historial de scans anteriores ────────────────────────────
@@ -779,10 +817,20 @@ const server = http.createServer(async (req, res) => {
     const b = await body(req);
     const keyword = (b.keyword || b.brand || '').trim();
     const pills: string[] = Array.isArray(b.pills) ? b.pills.map((p: string) => String(p).trim()).filter(Boolean) : [];
-    const days: number = typeof b.days === 'number' && b.days > 0 ? Math.min(b.days, 180) : 30;
     const exclusions: string[] = Array.isArray(b.exclusions) ? b.exclusions.map((e: string) => String(e).trim().toLowerCase().replace(/[@#]/g, '')).filter(Boolean) : [];
     const platforms: string[] = Array.isArray(b.platforms) ? b.platforms.map((p: string) => String(p).trim()).filter(Boolean) : [];
     if (!keyword) return json(res, { error: 'keyword requerida' }, 400);
+
+    // Fecha/rango específico (YYYY-MM-DD) — si viene, los scrapers igual buscan
+    // con una ventana `days` que cubra de sobra el rango, y luego se recorta
+    // al rango exacto en runScan (inExactRange).
+    const startDate: string | undefined = typeof b.startDate === 'string' && b.startDate ? b.startDate : undefined;
+    const endDate: string | undefined = typeof b.endDate === 'string' && b.endDate ? b.endDate : undefined;
+    let days: number = typeof b.days === 'number' && b.days > 0 ? Math.min(b.days, 180) : 30;
+    if (startDate) {
+      const daysBack = Math.ceil((Date.now() - new Date(startDate).getTime()) / 86400000);
+      days = Math.min(Math.max(daysBack, 1), 180);
+    }
 
     if (status === 'running') {
       return json(res, { queued: false, message: `Ya hay un escaneo en curso: "${currentKeyword}". Espera que termine.` });
@@ -794,7 +842,7 @@ const server = http.createServer(async (req, res) => {
       setTimeout(() => reject(new Error('Scan superó el límite de 2 horas')), SCAN_TIMEOUT_MS)
     );
     Promise.race([
-      runScan(keyword, pills.length > 0 ? pills : undefined, days, exclusions, platforms),
+      runScan(keyword, pills.length > 0 ? pills : undefined, days, exclusions, platforms, { start: startDate, end: endDate }),
       scanTimeout,
     ]).catch(e => {
       console.error('[Server] Scan error:', e.message);
@@ -802,6 +850,20 @@ const server = http.createServer(async (req, res) => {
     });
 
     return json(res, { queued: true, keyword, message: `Escaneando "${keyword}"… puede tardar hasta 20-30 min dependiendo del volumen. Los resultados aparecerán en MUSE automáticamente.` });
+  }
+
+  // POST /stop — interrumpe el escaneo en curso cerrando el browser (los scrapers
+  // en vuelo fallan con "Target closed" y sus propios try/catch lo manejan).
+  if (method === 'POST' && url === '/stop') {
+    if (status !== 'running') {
+      return json(res, { stopped: false, message: 'No hay ningún escaneo en curso.' });
+    }
+    stopRequested = true;
+    await closeBrowser().catch(() => {});
+    status = 'error';
+    lastError = 'Escaneo detenido manualmente por el usuario.';
+    console.log('[Server] Escaneo detenido manualmente.');
+    return json(res, { stopped: true, message: 'Escaneo detenido.' });
   }
 
   // GET /results — payload con screenshots (ngrok es red local, timeout frontend = 120s)
