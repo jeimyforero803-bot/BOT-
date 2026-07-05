@@ -266,9 +266,13 @@ export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], 
       // Palabras de la marca — un hilo popular puede derivar a temas totalmente
       // ajenos (política, chismes, etc.) en sus replies externos; sin este filtro
       // esas respuestas se colaban como si fueran "menciones" de la marca.
-      const relevanceTerms = [keyword, ...extraTerms]
-        .flatMap(t => t.replace(/[@#]/g, '').toLowerCase().split(/\s+/))
-        .filter(w => w.length >= 3);
+      // length >= 2 (no >= 3) porque muchas marcas usan códigos cortos ("D1",
+      // "M2") que quedaban descartados, dejando solo la palabra genérica
+      // ("tiendas") — con esa única palabra, CUALQUIER reply sobre tiendas en
+      // general (no sobre D1) pasaba el filtro como si fuera relevante.
+      const relevanceTerms = [...new Set(
+        [keyword, ...extraTerms].flatMap(t => t.replace(/[@#]/g, '').toLowerCase().split(/\s+/)).filter(w => w.length >= 2)
+      )];
 
       const topTweets = Array.from(allTweets.values())
         .filter(t => isRecent(t.date, days))
@@ -340,8 +344,14 @@ export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], 
             if (!isRecent(r.date, 14)) continue;
             // Los replies externos (no del hilo del propio autor) solo se guardan si
             // de verdad mencionan la marca — si no, es una conversación ajena que
-            // solo coincidió de estar en el mismo hilo.
-            if (!r.isOP && !relevanceTerms.some(w => r.text.toLowerCase().includes(w))) continue;
+            // solo coincidió de estar en el mismo hilo. Con marca de varias palabras
+            // exigimos que aparezcan TODAS (no basta una sola, o "tiendas" solo ya
+            // calificaba como "relevante" para una búsqueda de "TIENDAS D1").
+            const replyTextLower = r.text.toLowerCase();
+            const isRelevantReply = relevanceTerms.length > 1
+              ? relevanceTerms.every(w => replyTextLower.includes(w))
+              : relevanceTerms.some(w => replyTextLower.includes(w));
+            if (!r.isOP && !isRelevantReply) continue;
             let rShot: string | undefined;
             if (j < 5 && replyEls[j + 1]) rShot = await takeScreenshot(replyEls[j + 1], 'tw_reply');
 

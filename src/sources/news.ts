@@ -87,16 +87,23 @@ async function fetchGoogleSearchNews(keyword: string, days: number, ctx: any): P
     // buscados. Sin esto, si Google no encontró noticias reales y la página
     // terminó mostrando otra cosa (sonidos de TikTok, videos, etc.), esos
     // resultados irrelevantes se colaban igual como si fueran "noticias".
+    // length >= 2 (no >= 3) — códigos de marca cortos ("D1", "M2") se perdían
+    // con el umbral anterior, dejando solo la palabra genérica ("tiendas") como
+    // criterio de relevancia y colando resultados que no eran del D1 buscado.
     const DIACRITICS = new RegExp('[\\u0300-\\u036f]', 'g');
     const kwTerms = keyword.replace(/"/g, '').toLowerCase()
       .normalize('NFD').replace(DIACRITICS, '')
-      .split(/\s+/).filter(w => w.length >= 3);
+      .split(/\s+/).filter(w => w.length >= 2);
 
     let undated = 0;
     for (const item of items) {
       const titleNorm = item.title.toLowerCase().normalize('NFD').replace(DIACRITICS, '');
       const urlNorm = item.url.toLowerCase();
-      const isRelevant = kwTerms.length === 0 || kwTerms.some(w => titleNorm.includes(w) || urlNorm.includes(w));
+      // Con marca de varias palabras exigimos que aparezcan TODAS — una sola
+      // palabra genérica no basta para calificar como relevante.
+      const isRelevant = kwTerms.length === 0 || (kwTerms.length > 1
+        ? kwTerms.every(w => titleNorm.includes(w) || urlNorm.includes(w))
+        : kwTerms.some(w => titleNorm.includes(w) || urlNorm.includes(w)));
       if (!isRelevant) continue;
 
       if (!item.time) undated++;
