@@ -263,6 +263,13 @@ export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], 
       const scoreEngagement = (t: any) =>
         parseInt(t.replies || '0') * 3 + parseInt((t.likes || '0').replace(/[^0-9]/g, '') || '0') / 10;
 
+      // Palabras de la marca — un hilo popular puede derivar a temas totalmente
+      // ajenos (política, chismes, etc.) en sus replies externos; sin este filtro
+      // esas respuestas se colaban como si fueran "menciones" de la marca.
+      const relevanceTerms = [keyword, ...extraTerms]
+        .flatMap(t => t.replace(/[@#]/g, '').toLowerCase().split(/\s+/))
+        .filter(w => w.length >= 3);
+
       const topTweets = Array.from(allTweets.values())
         .filter(t => isRecent(t.date, days))
         .sort((a, b) => scoreEngagement(b) - scoreEngagement(a))
@@ -331,6 +338,10 @@ export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], 
           for (let j = 0; j < threadItems.length; j++) {
             const r = threadItems[j];
             if (!isRecent(r.date, 14)) continue;
+            // Los replies externos (no del hilo del propio autor) solo se guardan si
+            // de verdad mencionan la marca — si no, es una conversación ajena que
+            // solo coincidió de estar en el mismo hilo.
+            if (!r.isOP && !relevanceTerms.some(w => r.text.toLowerCase().includes(w))) continue;
             let rShot: string | undefined;
             if (j < 5 && replyEls[j + 1]) rShot = await takeScreenshot(replyEls[j + 1], 'tw_reply');
 
