@@ -4,7 +4,7 @@
  */
 import {
   getContext, hasAuth, humanDelay, humanScroll,
-  takeScreenshot, waitForComments, parseRelativeDate, isRecent, delay, buildPreciseQuery,
+  takeScreenshot, waitForComments, parseRelativeDate, isRecent, getBatchReferenceNow, delay, buildPreciseQuery,
 } from '../browser.js';
 import type { Mention, Comment, Etiquetado } from '../types.js';
 
@@ -131,7 +131,10 @@ export async function scrapeThreads(keyword: string, extraTerms: string[] = [], 
   }
 
   const ctx = await getContext('threads');
-  const preciseQuery = buildPreciseQuery(keyword, extraTerms);
+  // Si hay un @handle real, buscar EXCLUSIVAMENTE eso — mismo criterio que
+  // Twitter: mucho más preciso que la palabra suelta para siglas ambiguas.
+  const handle = extraTerms.find(t => t.startsWith('@'));
+  const preciseQuery = handle || buildPreciseQuery(keyword, extraTerms);
 
   try {
     const page = await ctx.newPage();
@@ -235,35 +238,61 @@ export async function scrapeThreads(keyword: string, extraTerms: string[] = [], 
     await captureVisibleScreenshots();
     console.log(`[Threads] ${accumulated.size} posts iniciales (antes de scroll)`);
 
-    for (let s = 0; s < 60; s++) {
-      await page.mouse.wheel(0, 750);
-      await delay(900);
-      // Extraer en cada pasada — captura todo lo visible antes de que se virtualice
+    // Scroll dirigido por fecha — igual que Twitter: seguimos bajando hasta
+    // que el post más viejo visto cruce la fecha de inicio pedida, en vez de
+    // un número fijo de pasadas. Usa window.scrollBy (NO mouse.wheel — en
+    // Chromium headless mouse.wheel() dejaba de mover la página después de la
+    // primera pasada, haciendo que el scraper se quedara con un puñado de
+    // posts creyendo que ya no había más, cuando sí había mucho más contenido).
+    // Threads no tiene un operador de búsqueda tipo until: de X, así que no
+    // podemos "saltar" directo a una fecha pasada — el scroll siempre arranca
+    // desde lo más reciente, pero al menos ya no se corta antes de tiempo.
+    const targetStartMs = Date.now() - (days >= 1 ? Math.max(days, 30) : days) * 86400000;
+    const oldestSeenMs = (): number => {
+      let min = Infinity;
+      for (const p of accumulated.values()) {
+        const ms = new Date(parseRelativeDate(p.date)).getTime();
+        if (!isNaN(ms) && ms < min) min = ms;
+      }
+      return min;
+    };
+
+    let noNewStreak = 0;
+    const MAX_PASSES = 80;
+    for (let s = 0; s < MAX_PASSES; s++) {
+      const before = accumulated.size;
+
+      await page.evaluate(() => window.scrollBy(0, 1200));
+      await delay(1400);
+
       const batch = await extractPosts(page);
       for (const p of batch) {
         const key = p.text.slice(0, 50);
         if (!accumulated.has(key)) accumulated.set(key, p);
       }
-      // Capturar miniaturas cada 3 pasadas antes de que el DOM virtualice los posts
       if (s % 3 === 0) await captureVisibleScreenshots();
-    }
 
-    let posts = [...accumulated.values()];
-    console.log(`[Threads] ${posts.length} posts encontrados (acumulados durante scroll)`);
+      const after = accumulated.size;
+      console.log(`[Threads] Pasada ${s + 1}: ${after} posts (+${after - before})`);
 
-    if (posts.length < 3) {
-      for (let s = 0; s < 10; s++) {
-        await page.mouse.wheel(0, 1000);
-        await delay(1500);
-        const batch = await extractPosts(page);
-        for (const p of batch) {
-          const key = p.text.slice(0, 50);
-          if (!accumulated.has(key)) accumulated.set(key, p);
-        }
+      if (after >= 300) { console.log('[Threads] Tope de 300 posts, deteniendo scroll.'); break; }
+
+      const oldest = oldestSeenMs();
+      if (oldest <= targetStartMs) {
+        console.log(`[Threads] Fecha de inicio alcanzada (post más viejo visto: ${new Date(oldest).toISOString().slice(0, 10)}), deteniendo scroll.`);
+        break;
       }
-      posts = [...accumulated.values()];
-      console.log(`[Threads] Tras scroll extra: ${posts.length} posts`);
+
+      if (after === before) {
+        noNewStreak++;
+        if (noNewStreak > 5) { console.log('[Threads] Sin más posts nuevos, deteniendo scroll.'); break; }
+      } else {
+        noNewStreak = 0;
+      }
     }
+
+    const posts = [...accumulated.values()];
+    console.log(`[Threads] ${posts.length} posts encontrados (acumulados durante scroll)`);
 
     if (posts.length === 0) {
       console.warn('[Threads] 0 posts tras todos los intentos');
@@ -274,10 +303,14 @@ export async function scrapeThreads(keyword: string, extraTerms: string[] = [], 
     // Captura final de lo que quede visible en DOM
     await captureVisibleScreenshots();
 
+    // Ancla "ahora" a la fecha real más reciente vista en el scrape (no al
+    // reloj de esta máquina) — ver comentario en getBatchReferenceNow().
+    const referenceNow = getBatchReferenceNow(posts.map(p => parseRelativeDate(p.date)));
+
     for (let i = 0; i < posts.length; i++) {
       const post = posts[i];
       const isoDate = parseRelativeDate(post.date);
-      if (!isRecent(isoDate, days >= 1 ? Math.max(days, 30) : days)) continue;
+      if (!isRecent(isoDate, days >= 1 ? Math.max(days, 30) : days, referenceNow)) continue;
 
       const shot = screenshotMap.get(post.text.slice(0, 50));
 

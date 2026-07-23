@@ -5,7 +5,7 @@
  */
 import {
   getContext, hasAuth, humanDelay, humanScroll,
-  takeScreenshot, waitForComments, parseRelativeDate, isRecent, delay, buildPreciseQuery,
+  takeScreenshot, waitForComments, parseRelativeDate, isRecent, getBatchReferenceNow, delay, buildPreciseQuery,
 } from '../browser.js';
 import type { Mention, Comment, Etiquetado } from '../types.js';
 
@@ -376,7 +376,25 @@ export async function scrapeLinkedIn(keyword: string, extraTerms: string[] = [],
       })(700)
     `;
 
-    for (let s = 0; s < 40; s++) {
+    // Scroll dirigido por fecha — igual que Twitter/Threads: seguimos bajando
+    // hasta que el post más viejo visto cruce la fecha de inicio pedida, en
+    // vez de un número fijo de pasadas. LinkedIn no tiene un operador tipo
+    // until: de X, así que no podemos saltar directo a una fecha pasada — el
+    // scroll siempre arranca desde lo más reciente, pero ya no se corta antes
+    // de tiempo ni sigue de más una vez cubrió el rango pedido.
+    const targetStartMs = Date.now() - (days >= 1 ? Math.max(days, 30) : days) * 86400000;
+    const oldestSeenMs = (): number => {
+      let min = Infinity;
+      for (const p of accumulated.values()) {
+        const ms = new Date(parseRelativeDate(p.date)).getTime();
+        if (!isNaN(ms) && ms < min) min = ms;
+      }
+      return min;
+    };
+    let noNewStreak = 0;
+    const MAX_PASSES = 80;
+    for (let s = 0; s < MAX_PASSES; s++) {
+      const before = accumulated.size;
       await page.evaluate(scrollScript);
       await delay(1200);
       // Extraer en cada pasada — captura todo lo visible antes de que se virtualice
@@ -385,6 +403,24 @@ export async function scrapeLinkedIn(keyword: string, extraTerms: string[] = [],
         const key = p.text.slice(0, 50);
         if (!accumulated.has(key)) accumulated.set(key, p);
       }
+      const after = accumulated.size;
+      console.log(`[LinkedIn] Pasada ${s + 1}: ${after} posts (+${after - before})`);
+
+      if (after >= 200) { console.log('[LinkedIn] Tope de 200 posts, deteniendo scroll.'); break; }
+
+      const oldest = oldestSeenMs();
+      if (oldest <= targetStartMs) {
+        console.log(`[LinkedIn] Fecha de inicio alcanzada (post más viejo visto: ${new Date(oldest).toISOString().slice(0, 10)}), deteniendo scroll.`);
+        break;
+      }
+
+      if (after === before) {
+        noNewStreak++;
+        if (noNewStreak > 6) { console.log('[LinkedIn] Sin más posts nuevos, deteniendo scroll.'); break; }
+      } else {
+        noNewStreak = 0;
+      }
+
       // Capturar miniaturas cada 4 pasadas usando bounding boxes de los contenedores visibles
       if (s % 4 === 0) {
         try {
@@ -461,10 +497,14 @@ export async function scrapeLinkedIn(keyword: string, extraTerms: string[] = [],
       return { mentions, comments, etiquetados };
     }
 
+    // Ancla "ahora" a la fecha real más reciente vista en el scrape (no al
+    // reloj de esta máquina) — ver comentario en getBatchReferenceNow().
+    const referenceNow = getBatchReferenceNow(posts.map(p => parseRelativeDate(p.date)));
+
     for (let i = 0; i < posts.length; i++) {
       const post = posts[i];
       const isoDate = parseRelativeDate(post.date);
-      if (!isRecent(isoDate, days >= 1 ? Math.max(days, 30) : days)) continue;
+      if (!isRecent(isoDate, days >= 1 ? Math.max(days, 30) : days, referenceNow)) continue;
 
       // Omitir posts del perfil oficial de la marca (exclusiones de autor)
       if (excludedAuthors.length > 0) {

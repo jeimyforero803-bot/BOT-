@@ -6,7 +6,137 @@ import {
   getContext, humanDelay, humanScroll, takeScreenshot,
   scrollToLoadComments, waitForComments, parseRelativeDate, isRecent, delay,
 } from '../browser.js';
-import type { Mention, Comment, Etiquetado } from '../types.js';
+import type { Mention, Comment, Etiquetado, ProfilePost, ProfileInfo } from '../types.js';
+
+function parseCountYT(raw: string): number {
+  const t = (raw || '0').trim().replace(/[.,]/g, m => m); // conservar para K/M detection
+  const clean = t.replace(/[^0-9.,KkMmBb]/g, '');
+  if (/[Bb]$/.test(clean)) return Math.round(parseFloat(clean) * 1_000_000_000);
+  if (/[Mm]$/.test(clean)) return Math.round(parseFloat(clean) * 1_000_000);
+  if (/[Kk]$/.test(clean)) return Math.round(parseFloat(clean) * 1_000);
+  return parseInt(clean.replace(/[.,]/g, '')) || 0;
+}
+
+/**
+ * Visita el canal propio (youtube.com/@handle/videos) y extrae sus últimos N
+ * videos. Views y fecha vienen directo del grid; likes requieren abrir cada
+ * video (mismo patrón que scrapeYouTube con resultados de búsqueda).
+ */
+export async function scrapeYouTubeProfile(handle: string, maxPosts = 12): Promise<{
+  profile: ProfileInfo | null; posts: ProfilePost[];
+}> {
+  const clean = handle.replace(/^@/, '').trim();
+  const ctx = await getContext();
+  const posts: ProfilePost[] = [];
+  let profile: ProfileInfo | null = null;
+
+  try {
+    const page = await ctx.newPage();
+    await page.goto(`https://www.youtube.com/@${clean}/videos`, { waitUntil: 'domcontentloaded', timeout: 40000 });
+    const found = await page.waitForSelector('ytd-rich-item-renderer, ytd-grid-video-renderer', { timeout: 30000 }).catch(() => null);
+    if (!found) {
+      console.warn(`[YouTube Profile] Sin videos visibles para @${clean} (¿canal inexistente?)`);
+      await page.close();
+      return { profile: null, posts: [] };
+    }
+    await humanDelay(2000, 3000);
+
+    const profileData = await page.evaluate(() => {
+      const name = document.querySelector('#channel-name #text, ytd-channel-name #text')?.textContent?.trim() || '';
+      const avatar = (document.querySelector('#avatar img, yt-img-shadow#avatar img') as HTMLImageElement | null)?.src || '';
+      let subsRaw = '';
+      document.querySelectorAll('#subscriber-count, yt-formatted-string#subscriber-count').forEach(el => {
+        const t = el.textContent?.trim() || '';
+        if (t && !subsRaw) subsRaw = t;
+      });
+      return { name, avatar, subsRaw };
+    });
+
+    profile = {
+      platform: 'youtube',
+      handle: `@${clean}`,
+      displayName: profileData.name || clean,
+      avatar: profileData.avatar || undefined,
+      followers: profileData.subsRaw ? parseCountYT(profileData.subsRaw) : undefined,
+      profileUrl: `https://www.youtube.com/@${clean}`,
+    };
+
+    await humanScroll(page, 3);
+    await delay(1500);
+
+    const videos: { url: string; title: string; views: string; published: string }[] = await page.evaluate((max: number) => {
+      const items: { url: string; title: string; views: string; published: string }[] = [];
+      const seen = new Set<string>();
+      document.querySelectorAll('ytd-rich-item-renderer, ytd-grid-video-renderer').forEach(el => {
+        const titleEl = el.querySelector('#video-title, #video-title-link');
+        const href = (titleEl as HTMLAnchorElement)?.href || '';
+        if (!href || seen.has(href)) return;
+        seen.add(href);
+        const metaSpans = el.querySelectorAll('#metadata-line span');
+        items.push({
+          url: href,
+          title: titleEl?.textContent?.trim() || titleEl?.getAttribute('title') || '',
+          views: metaSpans[0]?.textContent?.trim() || '',
+          published: metaSpans[1]?.textContent?.trim() || '',
+        });
+      });
+      return items.slice(0, max);
+    }, maxPosts);
+
+    console.log(`[YouTube Profile] @${clean} → ${videos.length} videos en el grid`);
+
+    for (const vid of videos) {
+      const vPage = await ctx.newPage();
+      try {
+        await vPage.goto(vid.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await delay(3000);
+
+        let thumb: string | undefined;
+        const playerEl = await vPage.$('#movie_player, ytd-player');
+        if (playerEl) thumb = await takeScreenshot(playerEl, 'yt_profile_post');
+
+        const likesRaw = await vPage.evaluate(() => {
+          const selectors = [
+            'like-button-view-model button', 'segmented-like-dislike-button-view-model button',
+            '#segmented-like-button button', 'ytd-menu-renderer #top-level-buttons-computed button',
+          ];
+          for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            const aria = el?.getAttribute('aria-label') || '';
+            const m = aria.match(/([\d.,]+[KkMmBb]?)\s*(like|Me gusta)/i);
+            if (m) return m[1];
+          }
+          return '';
+        });
+
+        const dateISO = parseRelativeDate(vid.published);
+        posts.push({
+          platform: 'youtube',
+          url: vid.url,
+          thumbnail: thumb,
+          caption: (vid.title || '').slice(0, 500),
+          date: dateISO,
+          likes: likesRaw ? parseCountYT(likesRaw) : 0,
+          comments: 0, // YouTube no expone el conteo total sin abrir la sección de comentarios
+          views: vid.views ? parseCountYT(vid.views) : undefined,
+        });
+      } catch (e: any) {
+        console.warn('[YouTube Profile] Error en video:', e.message?.slice(0, 80));
+      }
+      await vPage.close();
+      await humanDelay(1800, 3000);
+    }
+
+    console.log(`[YouTube Profile] @${clean} → ${posts.length} posts extraídos`);
+    await page.close();
+  } catch (e: any) {
+    console.error('[YouTube Profile] Error:', e.message?.slice(0, 100));
+  } finally {
+    await ctx.close();
+  }
+
+  return { profile, posts };
+}
 
 export async function scrapeYouTube(keyword: string, _extraTerms: string[] = [], days = 30): Promise<{
   mentions: Mention[]; comments: Comment[]; etiquetados: Etiquetado[];
@@ -21,9 +151,16 @@ export async function scrapeYouTube(keyword: string, _extraTerms: string[] = [],
     const page = await ctx.newPage();
     console.log('[YouTube] Buscando videos recientes...');
 
-    // Filtro: última semana (sp=EgIIAw%3D%3D) o último mes (sp=EgIIBA%3D%3D)
+    // Filtro de fecha DINÁMICO según cuántos días atrás se pidió — antes estaba
+    // fijo en "último mes" (EgIIBA==), lo que rompía cualquier búsqueda de más
+    // de un mes atrás: el video quedaba excluido de raíz por YouTube y nunca
+    // iba a aparecer sin importar cuánto se scrolleara. YouTube no tiene rango
+    // exacto (solo Hoy/Semana/Mes/Año), así que para pedidos más viejos que un
+    // año no hay forma de acotar más — se depende del post-filtro por fecha.
+    // semana=EgIIAw==, mes=EgIIBA==, año=EgIIBQ==
+    const dateFilterCode = days <= 7 ? 'EgIIAw%3D%3D' : days <= 31 ? 'EgIIBA%3D%3D' : 'EgIIBQ%3D%3D';
     // Goto con retry automático — si falla el primer intento espera 4s y reintenta
-    const ytSearchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(keyword)}&sp=EgIIBA%3D%3D`;
+    const ytSearchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(keyword)}&sp=${dateFilterCode}`;
     const ytFallbackUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(keyword)}`;
     let ytLoaded = false;
     for (let attempt = 0; attempt < 2 && !ytLoaded; attempt++) {

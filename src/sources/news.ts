@@ -5,17 +5,28 @@
  * artículo real ("link roto"). Scrapeando el buscador directamente obtenemos la
  * URL final tal cual la entrega Google, además de poder ordenar por más reciente.
  */
-import { getContext, delay, buildPreciseQuery, parseRelativeDate, isRecent } from '../browser.js';
+import { getContext, delay, buildPreciseQuery, parseRelativeDate, isRecent, getBatchReferenceNow } from '../browser.js';
 import type { Mention, Comment } from '../types.js';
 
-async function fetchGoogleSearchNews(keyword: string, days: number, ctx: any): Promise<Mention[]> {
+/** Convierte "YYYY-MM-DD" al formato M/D/YYYY que espera el parámetro cdr: de Google */
+function toGoogleDate(iso: string): string {
+  const [y, m, d] = iso.split('-').map(Number);
+  return `${m}/${d}/${y}`;
+}
+
+async function fetchGoogleSearchNews(keyword: string, days: number, ctx: any, sinceDate?: string, untilDate?: string): Promise<Mention[]> {
   const results: Mention[] = [];
   let page: any;
   try {
     page = await ctx.newPage();
-    // tbs=qdr:X acota el rango que Google considera; sbd:1 ordena por fecha (más reciente primero)
-    const qdr = days <= 1 ? 'qdr:d' : days <= 7 ? 'qdr:w' : days <= 31 ? 'qdr:m' : 'qdr:y';
-    const url = `https://www.google.com/search?q=${encodeURIComponent(keyword)}&tbm=nws&tbs=${qdr},sbd:1&hl=es-419&gl=CO&num=20`;
+    // Si nos dieron un rango exacto (fechas pasadas, no "hoy"), usamos cdr:1
+    // con cd_min/cd_max — mucho más preciso que qdr:y para un mes específico
+    // ya viejo (ej. "mayo 2026"). Si no, tbs=qdr:X acota relativo a hoy.
+    const isPastRange = sinceDate && untilDate && (Date.now() - new Date(untilDate).getTime()) > 2 * 86400000;
+    const tbs = isPastRange
+      ? `cdr:1,cd_min:${toGoogleDate(sinceDate!)},cd_max:${toGoogleDate(untilDate!)},sbd:1`
+      : `${days <= 1 ? 'qdr:d' : days <= 7 ? 'qdr:w' : days <= 31 ? 'qdr:m' : 'qdr:y'},sbd:1`;
+    const url = `https://www.google.com/search?q=${encodeURIComponent(keyword)}&tbm=nws&tbs=${tbs}&hl=es-419&gl=CO&num=20`;
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForSelector('#search, #rso, #main', { timeout: 15000 }).catch(() => {});
@@ -95,6 +106,13 @@ async function fetchGoogleSearchNews(keyword: string, days: number, ctx: any): P
       .normalize('NFD').replace(DIACRITICS, '')
       .split(/\s+/).filter(w => w.length >= 2);
 
+    // Ancla "ahora" a la fecha real más reciente vista en el scrape (no al
+    // reloj de esta máquina) — Google Noticias también entrega fechas ABSOLUTAS
+    // ("4 jul 2026"), no solo relativas ("hace 2 días"). Ver getBatchReferenceNow().
+    const referenceNow = getBatchReferenceNow(
+      items.filter(it => it.time).map(it => parseRelativeDate(it.time))
+    );
+
     let undated = 0;
     for (const item of items) {
       const titleNorm = item.title.toLowerCase().normalize('NFD').replace(DIACRITICS, '');
@@ -107,8 +125,21 @@ async function fetchGoogleSearchNews(keyword: string, days: number, ctx: any): P
       if (!isRelevant) continue;
 
       if (!item.time) undated++;
-      const date = item.time ? parseRelativeDate(item.time) : new Date().toISOString();
-      if (!isRecent(date, days)) continue;
+      let date = item.time ? parseRelativeDate(item.time) : new Date().toISOString();
+
+      // Si buscamos con rango exacto (cdr:), Google YA garantizó que este
+      // artículo cae dentro de [sinceDate, untilDate] — pero el texto relativo
+      // que muestra ("hace 1 mes") es aproximado/redondeado, y al convertirlo
+      // a fecha absoluta a veces cae unos días fuera del rango real. En vez de
+      // descartarlo (perdiendo un artículo que Google mismo confirmó válido),
+      // lo recortamos al borde más cercano del rango pedido.
+      if (isPastRange) {
+        const dms = new Date(date).getTime();
+        const sinceMs = new Date(sinceDate!).getTime();
+        const untilMs = new Date(untilDate! + 'T23:59:59').getTime();
+        if (dms < sinceMs) date = new Date(sinceMs).toISOString();
+        else if (dms > untilMs) date = new Date(untilMs).toISOString();
+      } else if (!isRecent(date, days, referenceNow)) continue;
       results.push({
         platform: 'noticias',
         author: 'Google Noticias',
@@ -128,7 +159,7 @@ async function fetchGoogleSearchNews(keyword: string, days: number, ctx: any): P
   return results;
 }
 
-export async function scrapeNews(keyword: string, extraTerms: string[] = [], days = 30): Promise<{
+export async function scrapeNews(keyword: string, extraTerms: string[] = [], days = 30, _exclusions?: string[], sinceDate?: string, untilDate?: string): Promise<{
   mentions: Mention[]; comments: Comment[];
 }> {
   const mentions: Mention[] = [];
@@ -138,20 +169,17 @@ export async function scrapeNews(keyword: string, extraTerms: string[] = [], day
   try {
     // 1. Frase exacta de la marca — la búsqueda más específica primero
     const preciseQuery = buildPreciseQuery(keyword, extraTerms);
-    const precise = await fetchGoogleSearchNews(preciseQuery, days, ctx);
+    const precise = await fetchGoogleSearchNews(preciseQuery, days, ctx, sinceDate, untilDate);
     for (const m of precise) if (!mentions.some(x => x.url === m.url)) mentions.push(m);
 
-    // 2. Si la frase exacta trajo poco, complementar con términos individuales
-    if (mentions.length < 5) {
-      const extraTermsPlain = extraTerms
-        .map(t => t.replace(/[@#]/g, '').trim())
-        .filter(t => t.length >= 3 && t.toLowerCase() !== keyword.toLowerCase());
-      const uniqueTerms = [...new Map([keyword, ...extraTermsPlain].map(t => [t.toLowerCase(), t])).values()];
-      for (const term of uniqueTerms.slice(0, 3)) {
-        if (term.toLowerCase() === preciseQuery.replace(/"/g, '').toLowerCase()) continue;
-        const extra = await fetchGoogleSearchNews(term, days, ctx);
-        for (const m of extra) if (!mentions.some(x => x.url === m.url)) mentions.push(m);
-      }
+    // 2. Si la frase exacta trajo poco, complementar buscando SOLO el keyword
+    //    base — NO cada término extra por separado. Los extras (ej. "Colombia"
+    //    agregado para desambiguar una sigla) no son búsquedas válidas por sí
+    //    solas: "Colombia" sola trae cualquier noticia del país, sin relación
+    //    con la marca. El filtro de contexto en server.ts limpia el resto.
+    if (mentions.length < 5 && keyword.toLowerCase() !== preciseQuery.replace(/"/g, '').toLowerCase()) {
+      const extra = await fetchGoogleSearchNews(keyword, days, ctx, sinceDate, untilDate);
+      for (const m of extra) if (!mentions.some(x => x.url === m.url)) mentions.push(m);
     }
   } finally {
     await ctx.close();

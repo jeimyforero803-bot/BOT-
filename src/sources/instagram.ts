@@ -5,7 +5,208 @@ import {
   getContext, hasAuth, humanDelay, humanScroll,
   takeScreenshot, waitForComments, parseRelativeDate, isRecent, delay, buildPreciseQuery,
 } from '../browser.js';
-import type { Mention, Comment, Etiquetado } from '../types.js';
+
+// Ancla móvil de "ahora" a la fecha real más reciente vista en el scrape (no
+// al reloj de esta máquina) — Instagram procesa posts uno a uno (no en lote),
+// así que este valor se actualiza a medida que se descubren fechas reales.
+function bumpReference(current: number, isoDate: string): number {
+  const t = new Date(isoDate).getTime();
+  return !isNaN(t) && t > current ? t : current;
+}
+import type { Mention, Comment, Etiquetado, ProfilePost, ProfileInfo } from '../types.js';
+
+function parseEngagementCount(raw: string): number {
+  const t = (raw || '0').trim().replace(/,/g, '').replace(/\./g, '');
+  if (/K$/i.test(t)) return Math.round(parseFloat(t) * 1_000);
+  if (/M$/i.test(t)) return Math.round(parseFloat(t) * 1_000_000);
+  return parseInt(t.replace(/[^0-9]/g, '') || '0') || 0;
+}
+
+/**
+ * Visita el perfil propio de un handle y abre sus últimos N posts del grid
+ * para sacar likes/comentarios/caption reales — el grid en sí no expone esos
+ * números (solo aparecen al hacer hover, que no se puede leer del DOM
+ * estático), así que hay que abrir cada post, igual que hace scrapeInstagram
+ * con los posts que encuentra por hashtag/keyword.
+ */
+export async function scrapeInstagramProfile(handle: string, maxPosts = 12): Promise<{
+  profile: ProfileInfo | null; posts: ProfilePost[];
+}> {
+  const clean = handle.replace(/^@/, '').trim();
+  if (!hasAuth('instagram')) {
+    console.warn('[Instagram Profile] Sin sesión guardada. Corre: npm run setup → Instagram');
+    return { profile: null, posts: [] };
+  }
+
+  const ctx = await getContext('instagram');
+  const posts: ProfilePost[] = [];
+  let profile: ProfileInfo | null = null;
+
+  try {
+    const page = await ctx.newPage();
+    await page.goto(`https://www.instagram.com/${clean}/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    const hasHeader = await page.waitForSelector('header', { timeout: 20000 }).catch(() => null);
+    if (!hasHeader) {
+      console.warn(`[Instagram Profile] Perfil @${clean} no encontró header (¿no existe/privado?)`);
+      await page.close();
+      return { profile: null, posts: [] };
+    }
+    await humanDelay(2000, 3500);
+
+    const profileData = await page.evaluate(() => {
+      const name = document.querySelector('h2, h1')?.textContent?.trim() || '';
+      const bio = document.querySelector('div[class*="_aa_c"], section span[class]')?.textContent?.trim() || '';
+      const avatar = (document.querySelector('header img') as HTMLImageElement | null)?.src || '';
+      let followers = '';
+      document.querySelectorAll('header li, header ul li, header span, header div').forEach(el => {
+        if (followers) return;
+        const t = el.textContent?.trim() || '';
+        if (t.length < 30 && /segu|follow/i.test(t) && /^[\d.,]+[KkMm]?/.test(t)) { const m = t.match(/^([\d.,]+[KkMm]?)/); if (m) followers = m[1]; }
+      });
+      // Fallback: og:description del perfil — server-rendered, no depende del layout
+      // en vivo. Formato clásico: "1,234 Followers, 56 Following, 78 Posts - ..."
+      if (!followers) {
+        const og = document.querySelector('meta[property="og:description"]')?.getAttribute('content') || '';
+        const m = og.match(/([\d.,]+[KkMm]?)\s*(followers|seguidores)/i);
+        if (m) followers = m[1];
+      }
+      return { name, bio, avatar, followers };
+    });
+
+    profile = {
+      platform: 'instagram',
+      handle: `@${clean}`,
+      displayName: profileData.name || clean,
+      avatar: profileData.avatar || undefined,
+      bio: profileData.bio || undefined,
+      followers: profileData.followers ? parseEngagementCount(profileData.followers) : undefined,
+      profileUrl: `https://www.instagram.com/${clean}/`,
+    };
+
+    await humanScroll(page, 3);
+    await delay(1500);
+
+    const postLinks: string[] = await page.evaluate((max: number) => {
+      const links: string[] = [];
+      const seen = new Set<string>();
+      document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]').forEach(el => {
+        const href = (el as HTMLAnchorElement).href || '';
+        if (href && !seen.has(href)) { seen.add(href); links.push(href); }
+      });
+      return links.slice(0, max);
+    }, maxPosts);
+
+    console.log(`[Instagram Profile] @${clean} → ${postLinks.length} posts en el grid`);
+
+    for (const postUrl of postLinks) {
+      const pPage = await ctx.newPage();
+      try {
+        await pPage.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: 40000 });
+        await waitForComments(pPage, 'article', 1, 20000);
+        await delay(3000);
+
+        // Meta tags og:* — presentes en el HTML inicial (server-rendered), no
+        // dependen de hidratación de React ni de que el layout termine de pintar.
+        // Sirven de fallback robusto cuando el scraping del DOM en vivo falla
+        // por cambios de Instagram (locale, A/B de layout, contadores ocultos).
+        const meta = await pPage.evaluate(() => ({
+          ogDescription: document.querySelector('meta[property="og:description"]')?.getAttribute('content') || '',
+          ogImage: document.querySelector('meta[property="og:image"]')?.getAttribute('content') || '',
+        }));
+
+        // Miniatura: captura visual del post. Espera a que la imagen/video real
+        // pinte (no solo el skeleton) antes de disparar el screenshot, con un
+        // reintento — evita el placeholder vacío por timing.
+        let thumb: string | undefined;
+        const articleEl = await pPage.$('article');
+        if (articleEl) {
+          await pPage.waitForSelector('article img[src], article video', { state: 'visible', timeout: 8000 }).catch(() => {});
+          thumb = await takeScreenshot(articleEl, 'ig_profile_post');
+          if (!thumb) {
+            await delay(1500);
+            thumb = await takeScreenshot(articleEl, 'ig_profile_post');
+          }
+        }
+        if (!thumb) thumb = meta.ogImage || undefined;
+
+        // IMPORTANTE: todas las queries van escopadas a articleEl (el post), NO a
+        // document — hacerlo document-wide capturaba texto de la navegación fija
+        // de la página (ej. el link "Inicio" del sidebar) en vez del contenido
+        // real del post, y el selector de likes podía matchear cualquier <section>
+        // de la página en vez de la del post.
+        const postData = articleEl
+          ? await articleEl.evaluate((article: Element) => {
+              let caption = '';
+              article.querySelectorAll('h1, span[dir="auto"], div[dir="auto"]').forEach(el => {
+                const txt = el.textContent?.trim() || '';
+                if (txt.length > 5 && !caption) caption = txt;
+              });
+              const likesEl = article.querySelector('section span[class], [class*="like_count"]');
+              const likes = likesEl?.textContent?.trim() || '0';
+              const timeEl = article.querySelector('time');
+              const date = timeEl?.getAttribute('datetime') || '';
+              // Videos/reels muestran "views" en vez de likes en algunos layouts
+              let views = '';
+              let commentsCount = '';
+              article.querySelectorAll('span, a').forEach(s => {
+                const t = s.textContent?.trim() || '';
+                if (!views && /^[\d.,]+[KkMm]?\s*(reproducci|view)/i.test(t)) { const m = t.match(/^([\d.,]+[KkMm]?)/); if (m) views = m[1]; }
+                if (!commentsCount && /(ver los|view all|comentario|comment)/i.test(t) && /[\d.,]+[KkMm]?/.test(t)) {
+                  const m = t.match(/([\d.,]+[KkMm]?)\s*(comentario|comment)/i);
+                  if (m) commentsCount = m[1];
+                }
+              });
+              return { caption, likes, date, views, commentsCount };
+            })
+          : { caption: '', likes: '0', date: '', views: '', commentsCount: '' };
+
+        // Fallback de likes/comentarios desde og:description si el DOM no dio nada
+        // (formato clásico IG: "1,234 Likes, 56 Comments - user on Instagram: ...")
+        let likesRaw = postData.likes;
+        let commentsRaw = postData.commentsCount;
+        if ((!likesRaw || likesRaw === '0') && meta.ogDescription) {
+          const m = meta.ogDescription.match(/([\d.,]+[KkMm]?)\s*(likes|me gusta)/i);
+          if (m) likesRaw = m[1];
+        }
+        if (!commentsRaw && meta.ogDescription) {
+          const m = meta.ogDescription.match(/([\d.,]+[KkMm]?)\s*(comments|comentarios)/i);
+          if (m) commentsRaw = m[1];
+        }
+        // Fallback de caption desde og:description — formato clásico IG:
+        // '1,234 Likes, 56 Comments - user on Instagram: "texto del caption"'
+        let captionOut = postData.caption;
+        if (!captionOut && meta.ogDescription) {
+          const m = meta.ogDescription.match(/:\s*[“"](.+)[”"]\s*$/);
+          if (m) captionOut = m[1];
+        }
+
+        posts.push({
+          platform: 'instagram',
+          url: postUrl,
+          thumbnail: thumb,
+          caption: (captionOut || '').slice(0, 500),
+          date: postData.date || new Date().toISOString(),
+          likes: parseEngagementCount(likesRaw),
+          comments: commentsRaw ? parseEngagementCount(commentsRaw) : 0,
+          views: postData.views ? parseEngagementCount(postData.views) : undefined,
+        });
+      } catch (e: any) {
+        console.warn('[Instagram Profile] Error en post:', e.message?.slice(0, 80));
+      }
+      await pPage.close();
+      await humanDelay(1800, 3000);
+    }
+
+    console.log(`[Instagram Profile] @${clean} → ${posts.length} posts extraídos`);
+    await page.close();
+  } catch (e: any) {
+    console.error('[Instagram Profile] Error:', e.message?.slice(0, 100));
+  } finally {
+    await ctx.close();
+  }
+
+  return { profile, posts };
+}
 
 export async function scrapeInstagram(keyword: string, extraTerms: string[] = [], days = 30): Promise<{
   mentions: Mention[]; comments: Comment[]; etiquetados: Etiquetado[];
@@ -79,6 +280,8 @@ export async function scrapeInstagram(keyword: string, extraTerms: string[] = []
 
     console.log(`[Instagram] Total: ${postLinks.length} posts a procesar`);
 
+    let referenceNow = Date.now();
+
     for (const postUrl of postLinks) {
       const pPage = await ctx.newPage();
       try {
@@ -130,8 +333,10 @@ export async function scrapeInstagram(keyword: string, extraTerms: string[] = []
           return { author, caption, likes, date };
         });
 
+        referenceNow = bumpReference(referenceNow, postData.date);
+
         // Filtrar posts antiguos (> 30 días)
-        if (!isRecent(postData.date, days)) {
+        if (!isRecent(postData.date, days, referenceNow)) {
           console.log(`[Instagram] Saltando post antiguo: ${postUrl.slice(-20)}`);
           await pPage.close();
           continue;
@@ -161,6 +366,7 @@ export async function scrapeInstagram(keyword: string, extraTerms: string[] = []
         }
 
         // Expandir comentarios — múltiples clicks en "Ver todos los comentarios"
+        let expandClickedAny = false;
         for (let attempt = 0; attempt < 3; attempt++) {
           try {
             const loadMoreBtns = await pPage.$$('button, [role="button"], span[role="button"]');
@@ -173,6 +379,7 @@ export async function scrapeInstagram(keyword: string, extraTerms: string[] = []
                 await btn.click();
                 await delay(2500);
                 clicked = true;
+                expandClickedAny = true;
                 break;
               }
             }
@@ -180,19 +387,33 @@ export async function scrapeInstagram(keyword: string, extraTerms: string[] = []
           } catch { break; }
         }
 
-        // Scroll agresivo dentro del contenedor de comentarios
-        try {
-          const commentContainer = await pPage.$('ul[class], article ul, section ul, [role="list"], [aria-label*="omentario"]');
-          if (commentContainer) {
-            for (let s = 0; s < 6; s++) {
-              await pPage.evaluate(el => el.scrollBy(0, 500), commentContainer);
-              await delay(900);
-            }
-          }
-        } catch { /* ok */ }
+        // Si no había botón de "cargar más" y ya se ven pocos comentarios, es un
+        // hilo corto (1-2 comentarios visibles a simple vista) — el scroll agresivo
+        // y las esperas largas de abajo no van a revelar nada nuevo, solo hacían que
+        // el agente se quedara medio minuto extra en posts que ya estaban completos.
+        const quickCommentCount = await pPage.evaluate(() =>
+          document.querySelectorAll('article ul li, section ul li, [role="list"] li').length
+        ).catch(() => 0);
+        const likelyShortThread = !expandClickedAny && quickCommentCount <= 4;
 
-        await humanScroll(pPage, 5);
-        await delay(4000);
+        if (!likelyShortThread) {
+          // Scroll agresivo dentro del contenedor de comentarios
+          try {
+            const commentContainer = await pPage.$('ul[class], article ul, section ul, [role="list"], [aria-label*="omentario"]');
+            if (commentContainer) {
+              for (let s = 0; s < 6; s++) {
+                await pPage.evaluate(el => el.scrollBy(0, 500), commentContainer);
+                await delay(900);
+              }
+            }
+          } catch { /* ok */ }
+
+          await humanScroll(pPage, 5);
+          await delay(4000);
+        } else {
+          await humanScroll(pPage, 1);
+          await delay(800);
+        }
 
         // Espera quirúrgica — múltiples selectores para IG moderno (2024-2025)
         const igCommentSels = [
@@ -271,7 +492,8 @@ export async function scrapeInstagram(keyword: string, extraTerms: string[] = []
         for (let j = 0; j < rawComments.length; j++) {
           const c = rawComments[j];
           const isoDate = parseRelativeDate(c.date);
-          if (!isRecent(isoDate, days)) continue;
+          referenceNow = bumpReference(referenceNow, isoDate);
+          if (!isRecent(isoDate, days, referenceNow)) continue;
 
           let cShot: string | undefined;
           const liIdx = j + 1; // +1 para saltar caption
@@ -345,7 +567,8 @@ export async function scrapeInstagram(keyword: string, extraTerms: string[] = []
                 const timeEl = document.querySelector('time');
                 return { author, caption, date: timeEl?.getAttribute('datetime') || new Date().toISOString() };
               });
-              if (isRecent(postData.date, 30)) {
+              referenceNow = bumpReference(referenceNow, postData.date);
+              if (isRecent(postData.date, 30, referenceNow)) {
                 mentions.push({ platform: 'instagram', author: postData.author || `#${extraHash}`, text: (postData.caption || `Post #${extraHash}`).slice(0, 400), url: postUrl, date: postData.date, tipo: 'post' } as any);
               }
               await pPage.close();

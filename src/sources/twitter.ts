@@ -2,17 +2,341 @@
  * Twitter/X scraper — sesión guardada + scroll profundo para máximos tweets
  */
 import {
-  getContext, hasAuth, humanDelay, humanScroll,
-  takeScreenshot, waitForComments, parseRelativeDate, isRecent, delay, buildPreciseQuery,
+  getContext, hasAuth, humanDelay,
+  takeScreenshot, waitForComments, parseRelativeDate, isRecent, getBatchReferenceNow, delay, buildPreciseQuery,
 } from '../browser.js';
-import type { Mention, Comment, Etiquetado } from '../types.js';
+import type { Mention, Comment, Etiquetado, ProfilePost, ProfileInfo } from '../types.js';
 
-export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], days = 45): Promise<{
-  mentions: Mention[]; comments: Comment[]; etiquetados: Etiquetado[];
-}> {
-  const mentions: Mention[] = [];
+type RawTweet = {
+  author: string; handle: string; text: string; url: string;
+  likes: string; retweets: string; replies: string;
+  isReply: boolean; date: string;
+};
+
+/**
+ * Busca "query" en X y scrollea hasta que el tweet más viejo visto cruce
+ * `targetStartMs` (fecha de inicio pedida) — igual que alguien scrolleando
+ * manualmente hasta encontrar esa fecha, en vez de un número fijo de pasadas.
+ *
+ * IMPORTANTE: usa `page.evaluate(() => window.scrollBy(...))` para scrollear,
+ * NO `page.mouse.wheel()` — en Chromium headless, mouse.wheel() dejaba de
+ * mover la página después de la primera pasada (scrollY se quedaba fijo para
+ * siempre), lo que hacía que el scraper concluyera "sin más tweets" tras
+ * encontrar solo un puñado, cuando en realidad había muchísimo más contenido
+ * disponible (confirmado comparando contra una sesión real scrolleada a mano).
+ */
+async function searchAndScrollTweets(page: any, query: string, targetStartMs: number): Promise<Map<string, RawTweet>> {
+  const twSearchUrl = `https://twitter.com/search?q=${encodeURIComponent(query)}&src=typed_query&f=live`;
+  let loaded = false;
+  for (let attempt = 0; attempt < 2 && !loaded; attempt++) {
+    try {
+      if (attempt > 0) { console.log('[Twitter] Reintentando carga...'); await delay(4000); }
+      await page.goto(twSearchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      loaded = true;
+    } catch { /* reintentar */ }
+  }
+  if (!loaded) throw new Error('Twitter no respondió tras 2 intentos');
+
+  const found = await waitForComments(page, '[data-testid="tweet"]', 2, 45000);
+  if (!found) {
+    await page.goto(
+      `https://twitter.com/search?q=${encodeURIComponent(query)}&src=typed_query`,
+      { waitUntil: 'domcontentloaded', timeout: 60000 }
+    );
+    await waitForComments(page, '[data-testid="tweet"]', 1, 45000);
+  }
+
+  await humanDelay(2000, 3500);
+
+  const allTweets = new Map<string, RawTweet>();
+
+  const extractTweets = async () => {
+    const batch: RawTweet[] = await page.evaluate(() => {
+      const items: {
+        author: string; handle: string; text: string; url: string;
+        likes: string; retweets: string; replies: string;
+        isReply: boolean; date: string;
+      }[] = [];
+
+      document.querySelectorAll('[data-testid="tweet"]').forEach(el => {
+        const userNameEl = el.querySelector('[data-testid="User-Name"]');
+        const authorText = userNameEl?.textContent || '';
+        const atIdx = authorText.indexOf('@');
+        const name = atIdx > 0 ? authorText.slice(0, atIdx).trim() : authorText.trim();
+        const handle = atIdx >= 0 ? '@' + authorText.slice(atIdx + 1).split(/\s|·/)[0].trim() : '';
+
+        const textEl = el.querySelector('[data-testid="tweetText"]');
+        const text = textEl?.textContent?.trim() || '';
+        if (!text) return;
+
+        const linkEl = el.querySelector('a[href*="/status/"]') as HTMLAnchorElement;
+        if (!linkEl) return;
+        const rawHref = linkEl.href || '';
+        const url = rawHref.startsWith('http') ? rawHref : `https://twitter.com${new URL(rawHref).pathname}`;
+
+        const likesEl = el.querySelector('[data-testid="like"] span[data-testid="app-text-transition-container"]');
+        const repliesEl = el.querySelector('[data-testid="reply"] span[data-testid="app-text-transition-container"]');
+        const retweetEl = el.querySelector('[data-testid="retweet"] span[data-testid="app-text-transition-container"]');
+        const timeEl = el.querySelector('time');
+        const date = timeEl?.getAttribute('datetime') || new Date().toISOString();
+
+        const isReply = !!(
+          el.querySelector('[data-testid="socialContext"]') ||
+          el.textContent?.includes('Respondiendo a') ||
+          el.textContent?.includes('Replying to')
+        );
+
+        items.push({
+          author: name, handle, text, url,
+          likes: likesEl?.textContent?.trim() || '0',
+          retweets: retweetEl?.textContent?.trim() || '0',
+          replies: repliesEl?.textContent?.trim() || '0',
+          isReply, date,
+        });
+      });
+
+      return items;
+    });
+
+    for (const t of batch) {
+      if (!allTweets.has(t.url)) allTweets.set(t.url, t);
+    }
+  };
+
+  await extractTweets();
+  console.log(`[Twitter] Ronda 1: ${allTweets.size} tweets`);
+
+  const oldestSeenMs = (): number => {
+    let min = Infinity;
+    for (const t of allTweets.values()) {
+      const ms = new Date(t.date).getTime();
+      if (!isNaN(ms) && ms < min) min = ms;
+    }
+    return min;
+  };
+
+  let noNewStreak = 0;
+  const MAX_PASSES = 60;
+  for (let pass = 0; pass < MAX_PASSES; pass++) {
+    const before = allTweets.size;
+
+    await page.evaluate(() => window.scrollBy(0, 1400));
+    await delay(2200);
+
+    await extractTweets();
+    const after = allTweets.size;
+
+    console.log(`[Twitter] Pasada ${pass + 2}: ${after} tweets (+${after - before})`);
+
+    if (after >= 300) { console.log('[Twitter] Tope de 300 tweets, deteniendo scroll.'); break; }
+
+    const oldest = oldestSeenMs();
+    if (oldest <= targetStartMs) {
+      console.log(`[Twitter] Fecha de inicio alcanzada (tweet más viejo visto: ${new Date(oldest).toISOString().slice(0, 10)}), deteniendo scroll.`);
+      break;
+    }
+
+    if (after === before) {
+      noNewStreak++;
+      if (noNewStreak > 4) { console.log('[Twitter] Sin más tweets nuevos, deteniendo scroll.'); break; }
+    } else {
+      noNewStreak = 0;
+    }
+
+    await humanDelay(500, 1000);
+  }
+
+  return allTweets;
+}
+
+/**
+ * Abre los hilos de los tweets con más engagement y extrae sus replies —
+ * separado de la búsqueda/scroll principal para poder probar/depurar cada
+ * etapa de forma aislada.
+ */
+async function openThreadsForReplies(
+  ctx: any,
+  topTweets: RawTweet[],
+  keyword: string,
+  relevanceTerms: string[],
+  referenceNow: number,
+): Promise<{ comments: Comment[]; etiquetados: Etiquetado[] }> {
   const comments: Comment[] = [];
   const etiquetados: Etiquetado[] = [];
+
+  console.log(`[Twitter] Abriendo ${topTweets.length} hilos para extraer conversación completa...`);
+  for (const tweet of topTweets) {
+    try {
+      const tPage = await ctx.newPage();
+      await tPage.goto(tweet.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      const repliesFound = await waitForComments(tPage, '[data-testid="tweet"]', 2, 20000);
+      if (!repliesFound) { await tPage.close(); continue; }
+
+      // Scroll profundo para cargar toda la conversación
+      for (let s = 0; s < 10; s++) {
+        await tPage.evaluate(() => window.scrollBy({ top: 900, behavior: 'smooth' }));
+        await delay(1800);
+      }
+      await delay(2000);
+
+      const threadData = await tPage.evaluate((tweetText: string) => {
+        const allEls = Array.from(document.querySelectorAll('[data-testid="tweet"]'));
+        const items: {
+          author: string; handle: string; text: string; date: string; url: string;
+          isOP: boolean; isThreadChain: boolean;
+        }[] = [];
+        const seen = new Set<string>();
+
+        const mainAuthorEl = allEls[0]?.querySelector('[data-testid="User-Name"]');
+        const mainAuthorText = mainAuthorEl?.textContent || '';
+        const mainAtIdx = mainAuthorText.indexOf('@');
+        const mainHandle = mainAtIdx >= 0
+          ? '@' + mainAuthorText.slice(mainAtIdx + 1).split(/\s|·/)[0].trim()
+          : '';
+
+        allEls.slice(1).forEach(el => {
+          const userNameEl = el.querySelector('[data-testid="User-Name"]');
+          const authorText = userNameEl?.textContent || '';
+          const atIdx = authorText.indexOf('@');
+          const author = atIdx > 0 ? authorText.slice(0, atIdx).trim() : authorText.trim();
+          const handle = atIdx >= 0 ? '@' + authorText.slice(atIdx + 1).split(/\s|·/)[0].trim() : '';
+          const text = el.querySelector('[data-testid="tweetText"]')?.textContent?.trim() || '';
+          if (!text || text.length < 3) return;
+          const linkEl = el.querySelector('a[href*="/status/"]') as HTMLAnchorElement;
+          const url = linkEl?.href || '';
+          const date = el.querySelector('time')?.getAttribute('datetime') || new Date().toISOString();
+
+          const isOP = !!mainHandle && handle.toLowerCase() === mainHandle.toLowerCase();
+          const hasThreadLine = !!el.closest('[data-testid="cellInnerDiv"]')
+            ?.previousElementSibling?.querySelector('[data-testid="tweet"]');
+
+          if (!seen.has(text.slice(0, 30))) {
+            seen.add(text.slice(0, 30));
+            items.push({ author, handle, text, date, url, isOP, isThreadChain: isOP || hasThreadLine });
+          }
+        });
+        return { items: items.slice(0, 40), mainHandle };
+      }, tweet.text);
+
+      const replyEls = await tPage.$$('[data-testid="tweet"]');
+      const { items: threadItems } = threadData;
+
+      for (let j = 0; j < threadItems.length; j++) {
+        const r = threadItems[j];
+        if (!isRecent(r.date, 14, referenceNow)) continue;
+        // Los replies externos (no del hilo del propio autor) solo se guardan si
+        // de verdad mencionan la marca — si no, es una conversación ajena que
+        // solo coincidió de estar en el mismo hilo.
+        const replyTextLower = r.text.toLowerCase();
+        const isRelevantReply = relevanceTerms.length > 1
+          ? relevanceTerms.every(w => replyTextLower.includes(w))
+          : relevanceTerms.some(w => replyTextLower.includes(w));
+        if (!r.isOP && !isRelevantReply) continue;
+        let rShot: string | undefined;
+        if (j < 5 && replyEls[j + 1]) rShot = await takeScreenshot(replyEls[j + 1], 'tw_reply');
+
+        const contextPrefix = r.isOP
+          ? `[🧵 Hilo de ${r.handle}] `
+          : `[↩ Reply a ${tweet.author}] `;
+
+        comments.push({
+          platform: 'twitter',
+          author: `${r.author} ${r.handle}`.trim(),
+          text: (contextPrefix + r.text).slice(0, 700),
+          url: r.url || tweet.url,
+          url_fuente: tweet.url,
+          date: r.date,
+          screenshot: rShot,
+        } as any);
+
+        const atTags2 = r.text.match(/@[\w]+/g) || [];
+        for (const tag of atTags2) {
+          if (keyword.toLowerCase().split(/\s+/).some(p => tag.toLowerCase().replace('@', '').includes(p.slice(0, 5)))) {
+            etiquetados.push({ platform: 'twitter', quien: r.handle || r.author, texto: r.text.slice(0, 280), url: tweet.url, date: r.date, tipo: 'mencion' });
+          }
+        }
+        const hashes2 = r.text.match(/#[\wÀ-ɏ]+/g) || [];
+        for (const ht of hashes2) {
+          if (keyword.toLowerCase().split(/\s+/).some(p => ht.toLowerCase().replace('#', '').includes(p.slice(0, 5)))) {
+            etiquetados.push({ platform: 'twitter', quien: r.handle || r.author, texto: r.text.slice(0, 280), url: tweet.url, date: r.date, tipo: 'hashtag' });
+          }
+        }
+      }
+
+      const opReplies = threadItems.filter(r => r.isOP).length;
+      const extReplies = threadItems.length - opReplies;
+      console.log(`[Twitter] Hilo "${tweet.url.slice(-20)}" → ${opReplies} hilo-OP + ${extReplies} replies externos`);
+      await tPage.close();
+      await humanDelay(2000, 3500);
+    } catch (e: any) {
+      console.warn('[Twitter] Error en hilo:', e.message?.slice(0, 60));
+    }
+  }
+
+  return { comments, etiquetados };
+}
+
+/** Enriquece las menciones con el conteo de seguidores del autor (top 10 handles únicos). */
+async function enrichFollowerCounts(ctx: any, mentions: Mention[]): Promise<void> {
+  const parseFC = (raw: string): number => {
+    const t = raw.trim().replace(/,/g, '').replace(/\./g, '');
+    if (/M$/i.test(t)) return Math.round(parseFloat(t) * 1_000_000);
+    if (/K$/i.test(t)) return Math.round(parseFloat(t) * 1_000);
+    return parseInt(t) || 0;
+  };
+  const uniqueHandles = [...new Set(mentions.map(m => {
+    const parts = m.author.split(' ');
+    return parts.find(p => p.startsWith('@')) || '';
+  }).filter(h => h.length > 1))].slice(0, 10);
+
+  if (uniqueHandles.length === 0) return;
+
+  console.log(`[Twitter] Enriqueciendo ${uniqueHandles.length} perfiles con seguidores...`);
+  const followerMap = new Map<string, number>();
+  for (const handle of uniqueHandles) {
+    try {
+      const pPage = await ctx.newPage();
+      await pPage.goto(`https://twitter.com/${handle.replace('@', '')}`, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      await pPage.waitForSelector('a[href*="/followers"]', { timeout: 8000 }).catch(() => {});
+      const fRaw = await pPage.evaluate(() => {
+        for (const link of Array.from(document.querySelectorAll('a[href*="/followers"], a[href*="/verified_followers"]'))) {
+          for (const span of Array.from(link.querySelectorAll('span'))) {
+            const t = span.textContent?.trim() || '';
+            if (t && /^[\d.,]+[KkMm]?$/.test(t)) return t;
+          }
+        }
+        for (const link of Array.from(document.querySelectorAll('a[href*="/followers"]'))) {
+          const aria = (link as HTMLElement).getAttribute('aria-label') || '';
+          const m = aria.match(/([\d.,]+[KkMm]?)\s*(follower|seguidor)/i);
+          if (m) return m[1];
+        }
+        const allText = Array.from(document.querySelectorAll('[data-testid="UserProfileHeader_Items"] span, [data-testid="primaryColumn"] span'));
+        for (let i = 0; i < allText.length - 1; i++) {
+          const t = allText[i].textContent?.trim() || '';
+          const next = allText[i + 1]?.textContent?.trim().toLowerCase() || '';
+          if (/^[\d.,]+[KkMm]?$/.test(t) && (next.includes('follower') || next.includes('seguidor'))) return t;
+        }
+        return null;
+      });
+      if (fRaw) { const n = parseFC(fRaw); if (n > 0) followerMap.set(handle.toLowerCase(), n); }
+      await pPage.close();
+      await delay(1200);
+    } catch { /* skip */ }
+  }
+  for (const m of mentions) {
+    const h = (m.author.split(' ').find(p => p.startsWith('@')) || '').toLowerCase();
+    const fc = followerMap.get(h) ?? 0;
+    if (fc > 0) { (m as any).follower_count = fc; (m as any).is_influencer = fc >= 5000; }
+  }
+  console.log(`[Twitter] Seguidores enriquecidos para ${followerMap.size} autores`);
+}
+
+export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], days = 45, _exclusions?: string[], untilDate?: string): Promise<{
+  mentions: Mention[]; comments: Comment[]; etiquetados: Etiquetado[];
+}> {
+  let mentions: Mention[] = [];
+  let comments: Comment[] = [];
+  let etiquetados: Etiquetado[] = [];
   const useAuth = hasAuth('twitter');
   const ctx = await getContext(useAuth ? 'twitter' : undefined);
 
@@ -22,159 +346,38 @@ export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], 
     if (useAuth) {
       console.log('[Twitter] Usando sesión guardada...');
 
-      // Frase exacta en vez de "keyword" suelto — evita traer cualquier tweet
-      // que solo contenga una palabra del nombre de marca (falsos positivos).
-      const preciseQuery = buildPreciseQuery(keyword, extraTerms);
+      // Si hay un @handle real (cuenta oficial verificada), buscar EXCLUSIVAMENTE
+      // eso — es mucho más preciso que la palabra suelta. "ETB" solo trae ruido
+      // de cuentas ajenas que comparten la sigla (ETB vasca, "Elite Trainer Box"
+      // de Pokémon); "@ETB" sólo aparece cuando alguien etiqueta A ESA cuenta.
+      const handle = extraTerms.find(t => t.startsWith('@'));
+      const baseQuery = handle || buildPreciseQuery(keyword, extraTerms);
+
+      // Si el rango pedido termina en el pasado (no "hoy"), usamos until: para
+      // que X arranque la búsqueda directo ahí — si no, el scroll parte desde
+      // hoy y gasta el tope de tweets en contenido reciente que de todos modos
+      // se iba a descartar por estar fuera del rango pedido.
+      const isPastEnd = untilDate && (Date.now() - new Date(untilDate).getTime()) > 2 * 86400000;
+      const preciseQuery = isPastEnd ? `${baseQuery} until:${untilDate}` : baseQuery;
       console.log(`[Twitter] Búsqueda precisa: ${preciseQuery}`);
 
-      // Goto con retry automático — si falla espera 4s y reintenta
-      const twSearchUrl = `https://twitter.com/search?q=${encodeURIComponent(preciseQuery)}&src=typed_query&f=live`;
-      let twLoaded = false;
-      for (let attempt = 0; attempt < 2 && !twLoaded; attempt++) {
-        try {
-          if (attempt > 0) { console.log('[Twitter] Reintentando carga...'); await delay(4000); }
-          await page.goto(twSearchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-          twLoaded = true;
-        } catch { /* reintentar */ }
-      }
-      if (!twLoaded) throw new Error('Twitter no respondió tras 2 intentos');
+      const targetStartMs = Date.now() - days * 86400000;
+      const allTweets = await searchAndScrollTweets(page, preciseQuery, targetStartMs);
 
-      const found = await waitForComments(page, '[data-testid="tweet"]', 2, 45000);
-      if (!found) {
-        await page.goto(
-          `https://twitter.com/search?q=${encodeURIComponent(preciseQuery)}&src=typed_query`,
-          { waitUntil: 'domcontentloaded', timeout: 60000 }
-        );
-        await waitForComments(page, '[data-testid="tweet"]', 1, 45000);
-      }
-
-      await humanDelay(2000, 3500);
-
-      // Colección incremental — recolectar tweets en cada pasada de scroll
-      const allTweets = new Map<string, any>(); // url → tweet data
-
-      const extractTweets = async () => {
-        const batch = await page.evaluate(() => {
-          const items: {
-            author: string; handle: string; text: string; url: string;
-            likes: string; retweets: string; replies: string;
-            isReply: boolean; date: string;
-          }[] = [];
-
-          document.querySelectorAll('[data-testid="tweet"]').forEach(el => {
-            const userNameEl = el.querySelector('[data-testid="User-Name"]');
-            const authorText = userNameEl?.textContent || '';
-            const atIdx = authorText.indexOf('@');
-            const name = atIdx > 0 ? authorText.slice(0, atIdx).trim() : authorText.trim();
-            const handle = atIdx >= 0 ? '@' + authorText.slice(atIdx + 1).split(/\s|·/)[0].trim() : '';
-
-            const textEl = el.querySelector('[data-testid="tweetText"]');
-            const text = textEl?.textContent?.trim() || '';
-            if (!text) return;
-
-            const linkEl = el.querySelector('a[href*="/status/"]') as HTMLAnchorElement;
-            if (!linkEl) return;
-            const rawHref = linkEl.href || '';
-            const url = rawHref.startsWith('http') ? rawHref : `https://twitter.com${new URL(rawHref).pathname}`;
-
-            const likesEl = el.querySelector('[data-testid="like"] span[data-testid="app-text-transition-container"]');
-            const repliesEl = el.querySelector('[data-testid="reply"] span[data-testid="app-text-transition-container"]');
-            const retweetEl = el.querySelector('[data-testid="retweet"] span[data-testid="app-text-transition-container"]');
-            const timeEl = el.querySelector('time');
-            const date = timeEl?.getAttribute('datetime') || new Date().toISOString();
-
-            const isReply = !!(
-              el.querySelector('[data-testid="socialContext"]') ||
-              el.textContent?.includes('Respondiendo a') ||
-              el.textContent?.includes('Replying to')
-            );
-
-            items.push({
-              author: name, handle, text, url,
-              likes: likesEl?.textContent?.trim() || '0',
-              retweets: retweetEl?.textContent?.trim() || '0',
-              replies: repliesEl?.textContent?.trim() || '0',
-              isReply, date,
-            });
-          });
-
-          return items;
-        });
-
-        for (const t of batch) {
-          if (!allTweets.has(t.url)) allTweets.set(t.url, t);
-        }
-      };
-
-      // Clic inicial para dar foco antes de scrollear
-      await page.mouse.click(600, 400).catch(() => {});
-      await delay(500);
-
-      // Primera extracción — captura tweets visibles al cargar
-      await extractTweets();
-      console.log(`[Twitter] Ronda 1: ${allTweets.size} tweets`);
-
-      // 18 pasadas de scroll — extrae en cada pasada para no perder nada por virtualización
-      for (let pass = 0; pass < 18; pass++) {
-        const before = allTweets.size;
-
-        await page.mouse.wheel(0, 800);
-        await delay(1800);
-        await page.mouse.wheel(0, 600);
-        await delay(1500);
-
-        await delay(2000);
-
-        await extractTweets();
-        const after = allTweets.size;
-
-        console.log(`[Twitter] Ronda ${pass + 2}: ${after} tweets (+${after - before})`);
-
-        if (after >= 150) break;
-        if (after === before && pass > 3) {
-          console.log('[Twitter] Sin más tweets nuevos, deteniendo scroll.');
-          break;
-        }
-
-        await humanDelay(800, 1800);
-      }
-
-      // Segunda pasada: buscar tweets recientes con since:
-      const sinceDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-      const recentUrl = `https://twitter.com/search?q=${encodeURIComponent(preciseQuery + ` since:${sinceDate}`)}&src=typed_query&f=live`;
-      try {
-        await page.goto(recentUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        const recentFound = await waitForComments(page, '[data-testid="tweet"]', 2, 30000);
-        if (recentFound) {
-          await page.mouse.click(600, 400).catch(() => {});
-          await delay(500);
-          await humanDelay(2000, 3000);
-          for (let pass = 0; pass < 8; pass++) {
-            await page.mouse.wheel(0, 800);
-            await delay(1800);
-            await page.mouse.wheel(0, 600);
-            await delay(1500);
-            await delay(1500);
-            const before = allTweets.size;
-            await extractTweets();
-            const after = allTweets.size;
-            console.log(`[Twitter] Since-pass ${pass + 1}: ${after} tweets (+${after - before})`);
-            if (after === before && pass > 2) break;
-            await humanDelay(600, 1400);
-          }
-        }
-      } catch (e: any) {
-        console.warn('[Twitter] Segunda pasada (since:) falló:', e.message?.slice(0, 60));
-      }
-
-      const tweets = Array.from(allTweets.values()).slice(0, 150);
+      const tweets = Array.from(allTweets.values()).slice(0, 300);
       console.log(`[Twitter] Total: ${tweets.length} tweets únicos`);
+
+      // Ancla "ahora" a la fecha real más reciente vista en el scrape, no al
+      // reloj de esta máquina: X entrega fechas absolutas reales y si el reloj
+      // local está desincronizado, comparar contra Date.now() descarta todo
+      // como "viejo" y la búsqueda vuelve 0 resultados aunque sí haya tweets recientes.
+      const referenceNow = getBatchReferenceNow(tweets.map(t => t.date));
 
       const tweetEls = await page.$$('[data-testid="tweet"]');
 
       for (let i = 0; i < tweets.length; i++) {
         const t = tweets[i];
-        if (!isRecent(t.date, days)) continue;
+        if (!isRecent(t.date, days, referenceNow)) continue;
 
         let screenshot: string | undefined;
         if (i < 10 && tweetEls[i]) screenshot = await takeScreenshot(tweetEls[i], 'tw_tweet');
@@ -195,15 +398,13 @@ export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], 
           mentions.push({ ...item, tipo: 'tweet' });
         }
 
-        // @menciones
         const atTags = t.text.match(/@[\w]+/g) || [];
         for (const tag of atTags) {
           if (keyword.toLowerCase().split(/\s+/).some(p => tag.toLowerCase().replace('@', '').includes(p.slice(0, 5)))) {
             etiquetados.push({ platform: 'twitter', quien: t.handle || t.author, texto: t.text.slice(0, 280), url: t.url, date: t.date, tipo: 'mencion' });
           }
         }
-        // #hashtags
-        const hashes = t.text.match(/#[\w\u00C0-\u024F]+/g) || [];
+        const hashes = t.text.match(/#[\wÀ-ɏ]+/g) || [];
         for (const ht of hashes) {
           if (keyword.toLowerCase().split(/\s+/).some(p => ht.toLowerCase().replace('#', '').includes(p.slice(0, 5)))) {
             etiquetados.push({ platform: 'twitter', quien: t.handle || t.author, texto: t.text.slice(0, 280), url: t.url, date: t.date, tipo: 'hashtag' });
@@ -213,12 +414,13 @@ export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], 
 
       console.log(`[Twitter] ${mentions.length} menciones + ${comments.length} replies en búsqueda`);
 
-      // Búsqueda adicional por @handles en extraTerms
-      const extraHandles = extraTerms.filter(t => t.startsWith('@'));
-      for (const handle of extraHandles.slice(0, 3)) {
+      // Búsqueda adicional por otros @handles en extraTerms — si ya usamos un
+      // handle como búsqueda principal (arriba), no repetirlo aquí.
+      const extraHandles = extraTerms.filter(t => t.startsWith('@') && t !== handle);
+      for (const handle2 of extraHandles.slice(0, 3)) {
         try {
           const hPage = await ctx.newPage();
-          const handleQ = `${handle} ${keyword}`;
+          const handleQ = `${handle2} ${keyword}`;
           await hPage.goto(
             `https://twitter.com/search?q=${encodeURIComponent(handleQ)}&src=typed_query&f=live`,
             { waitUntil: 'domcontentloaded', timeout: 30000 }
@@ -245,213 +447,46 @@ export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], 
               return items.slice(0, 20);
             });
             for (const t of hTweets) {
-              if (!isRecent(t.date, days)) continue;
+              if (!isRecent(t.date, days, referenceNow)) continue;
               if (!allTweets.has(t.url)) {
                 allTweets.set(t.url, { ...t, isReply: false, likes: '0', retweets: '0', replies: '0' });
                 mentions.push({ platform: 'twitter', author: `${t.author} ${t.handle}`.trim(), text: t.text.slice(0, 600), url: t.url, date: t.date, tipo: 'tweet' } as any);
               }
             }
-            console.log(`[Twitter] Handle ${handle}: ${hTweets.length} tweets extra`);
+            console.log(`[Twitter] Handle ${handle2}: ${hTweets.length} tweets extra`);
           }
           await hPage.close();
         } catch (e: any) {
-          console.warn(`[Twitter] Error buscando ${handle}:`, e.message?.slice(0, 50));
+          console.warn(`[Twitter] Error buscando ${handle2}:`, e.message?.slice(0, 50));
         }
       }
 
-      // Abrir hilos completos — top 12 tweets por engagement (replies + likes/10)
-      const scoreEngagement = (t: any) =>
+      // Abrir hilos completos — top 20 tweets por engagement (replies + likes/10)
+      const scoreEngagement = (t: RawTweet) =>
         parseInt(t.replies || '0') * 3 + parseInt((t.likes || '0').replace(/[^0-9]/g, '') || '0') / 10;
 
       // Palabras de la marca — un hilo popular puede derivar a temas totalmente
       // ajenos (política, chismes, etc.) en sus replies externos; sin este filtro
       // esas respuestas se colaban como si fueran "menciones" de la marca.
-      // length >= 2 (no >= 3) porque muchas marcas usan códigos cortos ("D1",
-      // "M2") que quedaban descartados, dejando solo la palabra genérica
-      // ("tiendas") — con esa única palabra, CUALQUIER reply sobre tiendas en
-      // general (no sobre D1) pasaba el filtro como si fuera relevante.
       const relevanceTerms = [...new Set(
         [keyword, ...extraTerms].flatMap(t => t.replace(/[@#]/g, '').toLowerCase().split(/\s+/)).filter(w => w.length >= 2)
       )];
 
+      // Reducido de 20 a 5 — abrir hilos es lo más lento del scraper (~30s c/u)
+      // y lo que de verdad importa es traer los tweets/menciones del rango de
+      // fecha pedido, no la conversación completa de cada uno.
       const topTweets = Array.from(allTweets.values())
-        .filter(t => isRecent(t.date, days))
+        .filter(t => isRecent(t.date, days, referenceNow))
         .sort((a, b) => scoreEngagement(b) - scoreEngagement(a))
-        .slice(0, 20);
+        .slice(0, 5);
 
-      console.log(`[Twitter] Abriendo ${topTweets.length} hilos para extraer conversación completa...`);
-      for (const tweet of topTweets) {
-        try {
-          const tPage = await ctx.newPage();
-          await tPage.goto(tweet.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-          const repliesFound = await waitForComments(tPage, '[data-testid="tweet"]', 2, 20000);
-          if (!repliesFound) { await tPage.close(); continue; }
-
-          // Scroll profundo para cargar toda la conversación
-          for (let s = 0; s < 10; s++) {
-            await tPage.evaluate(() => window.scrollBy({ top: 900, behavior: 'smooth' }));
-            await delay(1800);
-          }
-          await delay(2000);
-
-          const threadData = await tPage.evaluate((tweetText: string) => {
-            const allEls = Array.from(document.querySelectorAll('[data-testid="tweet"]'));
-            const items: {
-              author: string; handle: string; text: string; date: string; url: string;
-              isOP: boolean; isThreadChain: boolean;
-            }[] = [];
-            const seen = new Set<string>();
-
-            // El primer tweet es el tweet principal
-            const mainAuthorEl = allEls[0]?.querySelector('[data-testid="User-Name"]');
-            const mainAuthorText = mainAuthorEl?.textContent || '';
-            const mainAtIdx = mainAuthorText.indexOf('@');
-            const mainHandle = mainAtIdx >= 0
-              ? '@' + mainAuthorText.slice(mainAtIdx + 1).split(/\s|·/)[0].trim()
-              : '';
-
-            allEls.slice(1).forEach(el => {
-              const userNameEl = el.querySelector('[data-testid="User-Name"]');
-              const authorText = userNameEl?.textContent || '';
-              const atIdx = authorText.indexOf('@');
-              const author = atIdx > 0 ? authorText.slice(0, atIdx).trim() : authorText.trim();
-              const handle = atIdx >= 0 ? '@' + authorText.slice(atIdx + 1).split(/\s|·/)[0].trim() : '';
-              const text = el.querySelector('[data-testid="tweetText"]')?.textContent?.trim() || '';
-              if (!text || text.length < 3) return;
-              const linkEl = el.querySelector('a[href*="/status/"]') as HTMLAnchorElement;
-              const url = linkEl?.href || '';
-              const date = el.querySelector('time')?.getAttribute('datetime') || new Date().toISOString();
-
-              // Detectar si es parte del hilo del OP (self-reply chain)
-              const isOP = !!mainHandle && handle.toLowerCase() === mainHandle.toLowerCase();
-              // Detectar si hay línea vertical de hilo (conecta tweets en cadena)
-              const hasThreadLine = !!el.closest('[data-testid="cellInnerDiv"]')
-                ?.previousElementSibling?.querySelector('[data-testid="tweet"]');
-
-              if (!seen.has(text.slice(0, 30))) {
-                seen.add(text.slice(0, 30));
-                items.push({ author, handle, text, date, url, isOP, isThreadChain: isOP || hasThreadLine });
-              }
-            });
-            return { items: items.slice(0, 40), mainHandle };
-          }, tweet.text);
-
-          const replyEls = await tPage.$$('[data-testid="tweet"]');
-          const { items: threadItems, mainHandle } = threadData;
-
-          for (let j = 0; j < threadItems.length; j++) {
-            const r = threadItems[j];
-            if (!isRecent(r.date, 14)) continue;
-            // Los replies externos (no del hilo del propio autor) solo se guardan si
-            // de verdad mencionan la marca — si no, es una conversación ajena que
-            // solo coincidió de estar en el mismo hilo. Con marca de varias palabras
-            // exigimos que aparezcan TODAS (no basta una sola, o "tiendas" solo ya
-            // calificaba como "relevante" para una búsqueda de "TIENDAS D1").
-            const replyTextLower = r.text.toLowerCase();
-            const isRelevantReply = relevanceTerms.length > 1
-              ? relevanceTerms.every(w => replyTextLower.includes(w))
-              : relevanceTerms.some(w => replyTextLower.includes(w));
-            if (!r.isOP && !isRelevantReply) continue;
-            let rShot: string | undefined;
-            if (j < 5 && replyEls[j + 1]) rShot = await takeScreenshot(replyEls[j + 1], 'tw_reply');
-
-            // Prefijo de contexto: hilo del autor vs reply externo
-            const contextPrefix = r.isOP
-              ? `[🧵 Hilo de ${r.handle}] `
-              : `[↩ Reply a ${tweet.author}] `;
-
-            comments.push({
-              platform: 'twitter',
-              author: `${r.author} ${r.handle}`.trim(),
-              text: (contextPrefix + r.text).slice(0, 700),
-              url: r.url || tweet.url,
-              url_fuente: tweet.url,
-              date: r.date,
-              screenshot: rShot,
-            } as any);
-
-            // @menciones y #hashtags en replies
-            const atTags2 = r.text.match(/@[\w]+/g) || [];
-            for (const tag of atTags2) {
-              if (keyword.toLowerCase().split(/\s+/).some(p => tag.toLowerCase().replace('@', '').includes(p.slice(0, 5)))) {
-                etiquetados.push({ platform: 'twitter', quien: r.handle || r.author, texto: r.text.slice(0, 280), url: tweet.url, date: r.date, tipo: 'mencion' });
-              }
-            }
-            const hashes2 = r.text.match(/#[\w\u00C0-\u024F]+/g) || [];
-            for (const ht of hashes2) {
-              if (keyword.toLowerCase().split(/\s+/).some(p => ht.toLowerCase().replace('#', '').includes(p.slice(0, 5)))) {
-                etiquetados.push({ platform: 'twitter', quien: r.handle || r.author, texto: r.text.slice(0, 280), url: tweet.url, date: r.date, tipo: 'hashtag' });
-              }
-            }
-          }
-
-          const opReplies = threadItems.filter(r => r.isOP).length;
-          const extReplies = threadItems.length - opReplies;
-          console.log(`[Twitter] Hilo "${tweet.url.slice(-20)}" → ${opReplies} hilo-OP + ${extReplies} replies externos`);
-          await tPage.close();
-          await humanDelay(2000, 3500);
-        } catch (e: any) {
-          console.warn('[Twitter] Error en hilo:', e.message?.slice(0, 60));
-        }
-      }
+      const threadResult = await openThreadsForReplies(ctx, topTweets, keyword, relevanceTerms, referenceNow);
+      comments = comments.concat(threadResult.comments);
+      etiquetados = etiquetados.concat(threadResult.etiquetados);
 
       console.log(`[Twitter] TOTAL: ${mentions.length} menciones + ${comments.length} replies`);
 
-      // ── Follower count enrichment (top 10 handles) ──
-      const parseFC = (raw: string): number => {
-        const t = raw.trim().replace(/,/g, '').replace(/\./g, '');
-        if (/M$/i.test(t)) return Math.round(parseFloat(t) * 1_000_000);
-        if (/K$/i.test(t)) return Math.round(parseFloat(t) * 1_000);
-        return parseInt(t) || 0;
-      };
-      const uniqueHandles = [...new Set(mentions.map(m => {
-        const parts = m.author.split(' ');
-        return parts.find(p => p.startsWith('@')) || '';
-      }).filter(h => h.length > 1))].slice(0, 10);
-
-      if (uniqueHandles.length > 0) {
-        console.log(`[Twitter] Enriqueciendo ${uniqueHandles.length} perfiles con seguidores...`);
-        const followerMap = new Map<string, number>();
-        for (const handle of uniqueHandles) {
-          try {
-            const pPage = await ctx.newPage();
-            await pPage.goto(`https://twitter.com/${handle.replace('@', '')}`, { waitUntil: 'domcontentloaded', timeout: 20000 });
-            await pPage.waitForSelector('a[href*="/followers"]', { timeout: 8000 }).catch(() => {});
-            const fRaw = await pPage.evaluate(() => {
-              // Método 1: link de seguidores con span numérico
-              for (const link of Array.from(document.querySelectorAll('a[href*="/followers"], a[href*="/verified_followers"]'))) {
-                for (const span of Array.from(link.querySelectorAll('span'))) {
-                  const t = span.textContent?.trim() || '';
-                  if (t && /^[\d.,]+[KkMm]?$/.test(t)) return t;
-                }
-              }
-              // Método 2: buscar en aria-label del link de followers
-              for (const link of Array.from(document.querySelectorAll('a[href*="/followers"]'))) {
-                const aria = (link as HTMLElement).getAttribute('aria-label') || '';
-                const m = aria.match(/([\d.,]+[KkMm]?)\s*(follower|seguidor)/i);
-                if (m) return m[1];
-              }
-              // Método 3: buscar spans con texto "Followers" cercano a un número
-              const allText = Array.from(document.querySelectorAll('[data-testid="UserProfileHeader_Items"] span, [data-testid="primaryColumn"] span'));
-              for (let i = 0; i < allText.length - 1; i++) {
-                const t = allText[i].textContent?.trim() || '';
-                const next = allText[i + 1]?.textContent?.trim().toLowerCase() || '';
-                if (/^[\d.,]+[KkMm]?$/.test(t) && (next.includes('follower') || next.includes('seguidor'))) return t;
-              }
-              return null;
-            });
-            if (fRaw) { const n = parseFC(fRaw); if (n > 0) followerMap.set(handle.toLowerCase(), n); }
-            await pPage.close();
-            await delay(1200);
-          } catch { /* skip */ }
-        }
-        for (const m of mentions) {
-          const h = (m.author.split(' ').find(p => p.startsWith('@')) || '').toLowerCase();
-          const fc = followerMap.get(h) ?? 0;
-          if (fc > 0) { (m as any).follower_count = fc; (m as any).is_influencer = fc >= 5000; }
-        }
-        console.log(`[Twitter] Seguidores enriquecidos para ${followerMap.size} autores`);
-      }
+      await enrichFollowerCounts(ctx, mentions);
 
     } else {
       // Sin sesión — Nitter
@@ -462,13 +497,12 @@ export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], 
       );
       await waitForComments(page, '.timeline-item', 1, 15000);
 
-      // Scroll Nitter para más resultados
       for (let p = 0; p < 4; p++) {
         await page.evaluate(() => window.scrollBy(0, 1000));
         await delay(2000);
       }
 
-      const tweets = await page.evaluate(() => {
+      const nitterTweets = await page.evaluate(() => {
         const items: { author: string; text: string; url: string; date: string }[] = [];
         document.querySelectorAll('.timeline-item:not(.show-more)').forEach(el => {
           const name = el.querySelector('.fullname')?.textContent?.trim() || '';
@@ -482,10 +516,10 @@ export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], 
         return items.filter(t => { if (seen.has(t.url)) return false; seen.add(t.url); return true; }).slice(0, 50);
       });
 
-      for (const t of tweets) {
+      for (const t of nitterTweets) {
         mentions.push({ platform: 'twitter', author: t.author, text: t.text.slice(0, 600), url: t.url, date: parseRelativeDate(t.date), tipo: 'tweet' });
       }
-      console.log(`[Twitter/Nitter] ${tweets.length} tweets`);
+      console.log(`[Twitter/Nitter] ${nitterTweets.length} tweets`);
     }
 
     await page.close();
@@ -499,4 +533,140 @@ export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], 
   mentions.sort(byDate);
   comments.sort(byDate);
   return { mentions, comments, etiquetados };
+}
+
+function parseEngagementCount(raw: string): number {
+  const t = (raw || '0').trim().replace(/,/g, '');
+  if (/K$/i.test(t)) return Math.round(parseFloat(t) * 1_000);
+  if (/M$/i.test(t)) return Math.round(parseFloat(t) * 1_000_000);
+  return parseInt(t.replace(/[^0-9]/g, '') || '0') || 0;
+}
+
+/**
+ * Visita el timeline PROPIO de un handle (no una búsqueda) y extrae sus
+ * últimos tweets con likes/retweets/replies reales — todo visible inline en
+ * el timeline, sin necesidad de abrir cada tweet (a diferencia de Instagram/
+ * YouTube). Requiere sesión guardada (mismo requisito que scrapeTwitter).
+ */
+export async function scrapeTwitterProfile(handle: string, maxPosts = 12): Promise<{
+  profile: ProfileInfo | null; posts: ProfilePost[];
+}> {
+  const clean = handle.replace(/^@/, '').trim();
+  const useAuth = hasAuth('twitter');
+  if (!useAuth) {
+    console.warn('[Twitter Profile] Sin sesión guardada. Corre: npm run setup → Twitter');
+    return { profile: null, posts: [] };
+  }
+
+  const ctx = await getContext('twitter');
+  const posts: ProfilePost[] = [];
+  let profile: ProfileInfo | null = null;
+
+  try {
+    const page = await ctx.newPage();
+    await page.goto(`https://twitter.com/${clean}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    const found = await waitForComments(page, '[data-testid="tweet"]', 1, 30000);
+    if (!found) {
+      console.warn(`[Twitter Profile] Sin tweets visibles para @${clean} (perfil privado/inexistente/protegido)`);
+      await page.close();
+      return { profile: null, posts: [] };
+    }
+
+    await humanDelay(1500, 2500);
+
+    const profileData = await page.evaluate(() => {
+      const nameEl = document.querySelector('[data-testid="UserName"] span');
+      const avatarEl = document.querySelector('a[href*="/photo"] img, [data-testid="UserAvatar-Container"] img') as HTMLImageElement | null;
+      const bioEl = document.querySelector('[data-testid="UserDescription"]');
+      let followers = '';
+      for (const link of Array.from(document.querySelectorAll('a[href*="/verified_followers"], a[href*="/followers"]'))) {
+        const t = link.textContent?.trim() || '';
+        const m = t.match(/^([\d.,]+[KkMm]?)/);
+        if (m) { followers = m[1]; break; }
+      }
+      return {
+        displayName: nameEl?.textContent?.trim() || '',
+        avatar: avatarEl?.src || '',
+        bio: bioEl?.textContent?.trim() || '',
+        followers,
+      };
+    });
+
+    profile = {
+      platform: 'twitter',
+      handle: `@${clean}`,
+      displayName: profileData.displayName || clean,
+      avatar: profileData.avatar || undefined,
+      bio: profileData.bio || undefined,
+      followers: profileData.followers ? parseEngagementCount(profileData.followers) : undefined,
+      profileUrl: `https://twitter.com/${clean}`,
+    };
+
+    const collected = new Map<string, RawTweet>();
+    const extract = async () => {
+      const batch: RawTweet[] = await page.evaluate(() => {
+        const items: any[] = [];
+        document.querySelectorAll('[data-testid="tweet"]').forEach(el => {
+          const textEl = el.querySelector('[data-testid="tweetText"]');
+          const text = textEl?.textContent?.trim() || '';
+          const linkEl = el.querySelector('a[href*="/status/"]') as HTMLAnchorElement;
+          if (!linkEl) return;
+          const url = linkEl.href;
+          const isPinned = !!el.textContent?.includes('Fijado') || !!el.textContent?.includes('Pinned');
+          const isRetweet = !!el.querySelector('[data-testid="socialContext"]');
+          const likesEl = el.querySelector('[data-testid="like"] span[data-testid="app-text-transition-container"]');
+          const repliesEl = el.querySelector('[data-testid="reply"] span[data-testid="app-text-transition-container"]');
+          const retweetEl = el.querySelector('[data-testid="retweet"] span[data-testid="app-text-transition-container"]');
+          const timeEl = el.querySelector('time');
+          const date = timeEl?.getAttribute('datetime') || '';
+          items.push({
+            author: '', handle: '', text, url,
+            likes: likesEl?.textContent?.trim() || '0',
+            retweets: retweetEl?.textContent?.trim() || '0',
+            replies: repliesEl?.textContent?.trim() || '0',
+            isReply: isRetweet && !isPinned,
+            date,
+          });
+        });
+        return items;
+      });
+      for (const t of batch) if (t.date && !collected.has(t.url)) collected.set(t.url, t);
+    };
+
+    await extract();
+    for (let pass = 0; pass < 8 && collected.size < maxPosts; pass++) {
+      await page.evaluate(() => window.scrollBy(0, 1200));
+      await delay(1800);
+      const before = collected.size;
+      await extract();
+      if (collected.size === before) break;
+    }
+
+    const postEls = await page.$$('[data-testid="tweet"]');
+    const items = Array.from(collected.values()).slice(0, maxPosts);
+    for (let i = 0; i < items.length; i++) {
+      const t = items[i];
+      let thumb: string | undefined;
+      if (postEls[i]) thumb = await takeScreenshot(postEls[i], 'tw_profile_post');
+      posts.push({
+        platform: 'twitter',
+        url: t.url,
+        thumbnail: thumb,
+        caption: t.text.slice(0, 500),
+        date: t.date,
+        likes: parseEngagementCount(t.likes),
+        comments: parseEngagementCount(t.replies),
+        shares: parseEngagementCount(t.retweets),
+      });
+    }
+
+    console.log(`[Twitter Profile] @${clean} → ${posts.length} posts extraídos`);
+    await page.close();
+  } catch (e: any) {
+    console.error('[Twitter Profile] Error:', e.message?.slice(0, 100));
+  } finally {
+    await ctx.close();
+  }
+
+  return { profile, posts };
 }

@@ -97,7 +97,7 @@ export async function takeScreenshot(element: any, prefix: string): Promise<stri
     const fname = `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.png`;
     const fpath = path.join(SCREENSHOTS_DIR, fname);
     const buffer = await element.screenshot({ path: fpath, type: 'png' });
-    // Devolver base64 data URL — evita bloqueo mixed-content en MUSE (HTTPS)
+    // Devolver base64 data URL — evita bloqueo mixed-content al servirla en el dashboard (HTTPS)
     const b64 = (buffer instanceof Buffer ? buffer : fs.readFileSync(fpath)).toString('base64');
     return `data:image/png;base64,${b64}`;
   } catch {
@@ -212,14 +212,39 @@ export function parseRelativeDate(raw: string): string {
   return new Date().toISOString();
 }
 
-/** Devuelve true si la fecha está dentro de los últimos `days` días */
-export function isRecent(isoDate: string, days = 45): boolean {
+/**
+ * Devuelve true si la fecha está dentro de los últimos `days` días.
+ *
+ * `referenceNow` por defecto es Date.now(), correcto para fechas RELATIVAS
+ * ("hace 2 días") porque parseRelativeDate ya las ancló al mismo reloj.
+ * Para fechas ABSOLUTAS leídas de un sitio externo (datetime="2026-01-15..."),
+ * pasar un `referenceNow` calculado con getBatchReferenceNow() sobre el lote
+ * scrapeado — si el reloj de esta máquina está desincronizado del real, comparar
+ * contra Date.now() descarta TODO el contenido real como "viejo" y no encuentra nada.
+ */
+export function isRecent(isoDate: string, days = 45, referenceNow: number = Date.now()): boolean {
   try {
-    const cutoff = Date.now() - days * 86400000;
+    const cutoff = referenceNow - days * 86400000;
     return new Date(isoDate).getTime() >= cutoff;
   } catch {
     return true;
   }
+}
+
+/**
+ * Calcula un "ahora" de referencia a partir de la fecha más reciente presente
+ * en un lote de fechas absolutas ya scrapeadas, para que isRecent() no dependa
+ * del reloj (posiblemente desincronizado) de esta máquina. Cae a Date.now()
+ * si no hay ninguna fecha válida en el lote.
+ */
+export function getBatchReferenceNow(isoDates: (string | undefined | null)[]): number {
+  let max = -Infinity;
+  for (const d of isoDates) {
+    if (!d) continue;
+    const t = new Date(d).getTime();
+    if (!isNaN(t) && t > max) max = t;
+  }
+  return max > -Infinity ? max : Date.now();
 }
 
 /**
@@ -233,6 +258,13 @@ export function buildPreciseQuery(keyword: string, extraTerms: string[] = []): s
   const plainExtras = extraTerms.filter(t =>
     !t.startsWith('@') && !t.startsWith('#') && t.toLowerCase() !== keyword.toLowerCase()
   );
-  const full = [keyword, ...plainExtras].join(' ').trim();
-  return full.includes(' ') ? `"${full}"` : full;
+  // Solo el keyword va entre comillas (frase exacta) cuando ya es multi-palabra
+  // en sí mismo (ej. "Tiendas D1" escrito así por el usuario) — los extras NO
+  // se pegan a esa frase. Antes se armaba TODO como una sola frase exacta
+  // ("ETB Colombia"), lo que exige que alguien escriba esas palabras juntas y
+  // seguidas — casi nadie lo hace, y la búsqueda no encontraba nada. Ahora los
+  // extras van como palabras sueltas (AND: deben aparecer, no necesariamente
+  // pegadas), que es lo que realmente sirve para desambiguar (ej. ETB + Colombia).
+  const keywordPart = keyword.includes(' ') ? `"${keyword}"` : keyword;
+  return [keywordPart, ...plainExtras].join(' ').trim();
 }

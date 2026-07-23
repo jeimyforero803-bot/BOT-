@@ -3,9 +3,148 @@
  */
 import {
   getContext, hasAuth, humanDelay, humanScroll,
-  takeScreenshot, waitForComments, parseRelativeDate, isRecent, delay,
+  takeScreenshot, waitForComments, parseRelativeDate, isRecent, getBatchReferenceNow, delay,
 } from '../browser.js';
-import type { Mention, Comment, Etiquetado } from '../types.js';
+import type { Mention, Comment, Etiquetado, ProfilePost, ProfileInfo } from '../types.js';
+
+function parseCountTT(raw: string): number {
+  const t = (raw || '0').trim().replace(/,/g, '');
+  if (/K$/i.test(t)) return Math.round(parseFloat(t) * 1_000);
+  if (/M$/i.test(t)) return Math.round(parseFloat(t) * 1_000_000);
+  if (/B$/i.test(t)) return Math.round(parseFloat(t) * 1_000_000_000);
+  return parseInt(t.replace(/[^0-9]/g, '') || '0') || 0;
+}
+
+/**
+ * Visita el perfil propio (tiktok.com/@handle) y extrae sus últimos N videos.
+ * Views vienen directo del grid (visibles sin abrir nada); likes/comments
+ * requieren abrir cada video, igual que hace scrapeTikTok con los resultados
+ * de búsqueda.
+ */
+export async function scrapeTikTokProfile(handle: string, maxPosts = 12): Promise<{
+  profile: ProfileInfo | null; posts: ProfilePost[];
+}> {
+  const clean = handle.replace(/^@/, '').trim();
+  const useAuth = hasAuth('tiktok');
+  const ctx = await getContext(useAuth ? 'tiktok' : undefined);
+  const posts: ProfilePost[] = [];
+  let profile: ProfileInfo | null = null;
+
+  try {
+    const page = await ctx.newPage();
+    await page.goto(`https://www.tiktok.com/@${clean}`, { waitUntil: 'domcontentloaded', timeout: 40000 });
+    const found = await waitForComments(page, 'a[href*="/video/"]', 1, 25000);
+    if (!found) {
+      console.warn(`[TikTok Profile] Sin videos visibles para @${clean} (¿perfil privado/inexistente?)`);
+      await page.close();
+      return { profile: null, posts: [] };
+    }
+    await humanDelay(2000, 3500);
+
+    const profileData = await page.evaluate(() => {
+      const name = document.querySelector('h1[data-e2e="user-title"], h2[data-e2e="user-subtitle"]')?.textContent?.trim() || '';
+      const bio = document.querySelector('h2[data-e2e="user-bio"]')?.textContent?.trim() || '';
+      const avatar = (document.querySelector('[data-e2e="user-avatar"] img') as HTMLImageElement | null)?.src || '';
+      const followers = document.querySelector('[data-e2e="followers-count"]')?.textContent?.trim() || '';
+      return { name, bio, avatar, followers };
+    });
+
+    profile = {
+      platform: 'tiktok',
+      handle: `@${clean}`,
+      displayName: profileData.name || clean,
+      avatar: profileData.avatar || undefined,
+      bio: profileData.bio || undefined,
+      followers: profileData.followers ? parseCountTT(profileData.followers) : undefined,
+      profileUrl: `https://www.tiktok.com/@${clean}`,
+    };
+
+    await humanScroll(page, 3);
+    await delay(1500);
+
+    const videos: { url: string; views: string }[] = await page.evaluate((max: number) => {
+      const items: { url: string; views: string }[] = [];
+      const seen = new Set<string>();
+      document.querySelectorAll('[data-e2e="user-post-item"], div[class*="DivItemContainer"]').forEach(container => {
+        const link = container.querySelector('a[href*="/video/"]') as HTMLAnchorElement;
+        if (!link || seen.has(link.href)) return;
+        seen.add(link.href);
+        const viewsEl = container.querySelector('[data-e2e="video-views"], strong[class*="StrongVideoCount"]');
+        items.push({ url: link.href, views: viewsEl?.textContent?.trim() || '' });
+      });
+      // Fallback si el contenedor específico no matcheó nada
+      if (items.length === 0) {
+        document.querySelectorAll('a[href*="/video/"]').forEach(el => {
+          const href = (el as HTMLAnchorElement).href;
+          if (href && !seen.has(href)) { seen.add(href); items.push({ url: href, views: '' }); }
+        });
+      }
+      return items.slice(0, max);
+    }, maxPosts);
+
+    console.log(`[TikTok Profile] @${clean} → ${videos.length} videos en el grid`);
+
+    for (const vid of videos) {
+      const vPage = await ctx.newPage();
+      try {
+        await vPage.goto(vid.url, { waitUntil: 'domcontentloaded', timeout: 35000 });
+        await delay(3500);
+
+        let thumb: string | undefined;
+        const videoEl = await vPage.$('[data-e2e="browse-video"], video, [class*="DivVideoWrapper"]');
+        if (videoEl) thumb = await takeScreenshot(videoEl, 'tt_profile_post');
+
+        const videoData = await vPage.evaluate(() => {
+          const desc = document.querySelector('[data-e2e="browse-video-desc"], [class*="DivVideoInfoContainer"] p, h1[class]')?.textContent?.trim() || '';
+          const likes = document.querySelector('[data-e2e="browse-like-count"], [class*="like-count"]')?.textContent?.trim() || '0';
+          const commentsCount = document.querySelector('[data-e2e="browse-comment-count"], [class*="comment-count"]')?.textContent?.trim() || '0';
+          let date = '';
+          try {
+            const nd = document.getElementById('__NEXT_DATA__');
+            if (nd) {
+              const data = JSON.parse(nd.textContent || '{}');
+              const ct = data?.props?.pageProps?.itemInfo?.itemStruct?.createTime;
+              if (ct) date = new Date(parseInt(ct) * 1000).toISOString();
+            }
+          } catch {}
+          return { desc, likes, commentsCount, date };
+        });
+
+        posts.push({
+          platform: 'tiktok',
+          url: vid.url,
+          thumbnail: thumb,
+          caption: (videoData.desc || '').slice(0, 500),
+          date: videoData.date || new Date().toISOString(),
+          likes: parseCountTT(videoData.likes),
+          comments: parseCountTT(videoData.commentsCount),
+          views: vid.views ? parseCountTT(vid.views) : undefined,
+        });
+      } catch (e: any) {
+        console.warn('[TikTok Profile] Error en video:', e.message?.slice(0, 80));
+      }
+      await vPage.close();
+      await humanDelay(2000, 3500);
+    }
+
+    console.log(`[TikTok Profile] @${clean} → ${posts.length} posts extraídos`);
+    await page.close();
+  } catch (e: any) {
+    console.error('[TikTok Profile] Error:', e.message?.slice(0, 100));
+  } finally {
+    await ctx.close();
+  }
+
+  return { profile, posts };
+}
+
+// Ancla móvil de "ahora" a la fecha real más reciente vista en el scrape (no
+// al reloj de esta máquina) — TikTok procesa videos uno a uno, así que este
+// valor se actualiza a medida que se descubren fechas reales más precisas.
+function bumpReference(current: number, isoDate: string): number {
+  const t = new Date(isoDate).getTime();
+  return !isNaN(t) && t > current ? t : current;
+}
 
 export async function scrapeTikTok(keyword: string, extraTerms: string[] = [], days = 30): Promise<{
   mentions: Mention[]; comments: Comment[]; etiquetados: Etiquetado[];
@@ -101,11 +240,16 @@ export async function scrapeTikTok(keyword: string, extraTerms: string[] = [], d
 
     console.log(`[TikTok] ${videoLinks.length} videos encontrados`);
 
+    let referenceNow = getBatchReferenceNow(
+      videoLinks.filter(v => v.cardDate).map(v => parseRelativeDate(v.cardDate))
+    );
+
     for (const vid of videoLinks) {
       // Pre-filtro por fecha del card de búsqueda (evita abrir videos evidentemente viejos)
       if (vid.cardDate) {
         const cardIso = parseRelativeDate(vid.cardDate);
-        if (!isRecent(cardIso, days)) {
+        referenceNow = bumpReference(referenceNow, cardIso);
+        if (!isRecent(cardIso, days, referenceNow)) {
           console.log(`[TikTok] Card antiguo (${vid.cardDate}), saltando: ${vid.url.slice(-30)}`);
           continue;
         }
@@ -228,7 +372,8 @@ export async function scrapeTikTok(keyword: string, extraTerms: string[] = [], d
           } catch {}
         }
 
-        if (uploadDate && !isRecent(uploadDate, days)) {
+        if (uploadDate) referenceNow = bumpReference(referenceNow, uploadDate);
+        if (uploadDate && !isRecent(uploadDate, days, referenceNow)) {
           console.log(`[TikTok] Saltando video antiguo (${uploadDate.slice(0, 10)}) de ${vid.author}`);
           mentions.pop(); // quitar la mención ya añadida
           await vPage.close();
@@ -364,7 +509,8 @@ export async function scrapeTikTok(keyword: string, extraTerms: string[] = [], d
         for (let j = 0; j < rawComments.length; j++) {
           const c = rawComments[j];
           const isoDate = parseRelativeDate(c.date);
-          if (!isRecent(isoDate, 30)) continue;
+          referenceNow = bumpReference(referenceNow, isoDate);
+          if (!isRecent(isoDate, 30, referenceNow)) continue;
 
           let cShot: string | undefined;
           if (j < 5 && commentEls[j]) cShot = await takeScreenshot(commentEls[j], 'tt_comment');
@@ -468,7 +614,8 @@ export async function scrapeTikTok(keyword: string, extraTerms: string[] = [], d
                 date: timeEl?.getAttribute('datetime') || new Date().toISOString(),
               };
             });
-            if (vData.text && isRecent(vData.date, days)) {
+            referenceNow = bumpReference(referenceNow, vData.date);
+            if (vData.text && isRecent(vData.date, days, referenceNow)) {
               mentions.push({ platform: 'tiktok', author: vData.author || `#${extraHash}`, text: vData.text.slice(0, 400), url: vUrl, date: vData.date, tipo: 'video' } as any);
             }
             await vPage.close();

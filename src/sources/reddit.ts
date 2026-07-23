@@ -3,7 +3,7 @@
  */
 import {
   getContext, humanDelay, humanScroll,
-  takeScreenshot, waitForComments, parseRelativeDate, isRecent, delay,
+  takeScreenshot, waitForComments, parseRelativeDate, isRecent, getBatchReferenceNow, delay,
 } from '../browser.js';
 import type { Mention, Comment, Etiquetado } from '../types.js';
 
@@ -74,10 +74,14 @@ export async function scrapeReddit(keyword: string, _extraTerms: string[] = [], 
 
     console.log(`[Reddit] Total: ${allPosts.length} posts únicos`);
 
+    // Ancla "ahora" a la fecha real más reciente vista en el scrape (no al
+    // reloj de esta máquina) — ver comentario en getBatchReferenceNow().
+    const referenceNow = getBatchReferenceNow(allPosts.map(p => parseRelativeDate(p.date)));
+
     // Procesar los primeros 8 posts
     for (const post of allPosts.slice(0, 8)) {
       const isoDate = parseRelativeDate(post.date);
-      if (!isRecent(isoDate, days)) {
+      if (!isRecent(isoDate, days, referenceNow)) {
         console.log(`[Reddit] Saltando post antiguo: "${post.title.slice(0, 40)}"`);
         continue;
       }
@@ -161,7 +165,7 @@ export async function scrapeReddit(keyword: string, _extraTerms: string[] = [], 
         for (let j = 0; j < rawComments.length; j++) {
           const c = rawComments[j];
           const cDate = parseRelativeDate(c.date);
-          if (!isRecent(cDate, days)) continue;
+          if (!isRecent(cDate, days, referenceNow)) continue;
 
           let cShot: string | undefined;
           if (j < 5 && commentEls[j]) cShot = await takeScreenshot(commentEls[j], 'reddit_comment');

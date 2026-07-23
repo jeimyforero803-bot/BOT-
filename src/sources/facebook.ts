@@ -4,7 +4,7 @@
 import {
   getContext, hasAuth, humanDelay, humanScroll,
   takeScreenshot, waitForComments, scrollToLoadComments,
-  parseRelativeDate, isRecent, delay,
+  parseRelativeDate, isRecent, getBatchReferenceNow, delay,
 } from '../browser.js';
 import type { Mention, Comment, Etiquetado } from '../types.js';
 
@@ -131,10 +131,14 @@ export async function scrapeFacebook(keyword: string, _extraTerms: string[] = []
     console.log(`[Facebook] ${posts.length} posts encontrados`);
     const articleEls = await page.$$(postSel);
 
+    // Ancla "ahora" a la fecha real más reciente vista en el scrape (no al
+    // reloj de esta máquina) — ver comentario en getBatchReferenceNow().
+    const referenceNow = getBatchReferenceNow(posts.map(p => parseRelativeDate(p.date)));
+
     for (let i = 0; i < posts.length; i++) {
       const post = posts[i];
       const isoDate = parseRelativeDate(post.date);
-      if (!isRecent(isoDate, days)) continue;
+      if (!isRecent(isoDate, days, referenceNow)) continue;
 
       let shot: string | undefined;
       if (i < 5 && articleEls[i]) shot = await takeScreenshot(articleEls[i], 'fb_post');
@@ -281,7 +285,7 @@ export async function scrapeFacebook(keyword: string, _extraTerms: string[] = []
           for (let j = 0; j < rawComments.length; j++) {
             const c = rawComments[j];
             const cDate = parseRelativeDate(c.date);
-            if (!isRecent(cDate, days)) continue;
+            if (!isRecent(cDate, days, referenceNow)) continue;
 
             let cShot: string | undefined;
             if (j < 5 && cEls[j]) cShot = await takeScreenshot(cEls[j], 'fb_comment');

@@ -13,19 +13,19 @@
 import 'dotenv/config';
 import http from 'http';
 import { spawn, type ChildProcess } from 'child_process';
-import { scrapeYouTube } from './src/sources/youtube.js';
+import { scrapeYouTube, scrapeYouTubeProfile } from './src/sources/youtube.js';
 import { scrapeReddit } from './src/sources/reddit.js';
 import { scrapeNews } from './src/sources/news.js';
-import { scrapeTwitter } from './src/sources/twitter.js';
-import { scrapeInstagram } from './src/sources/instagram.js';
-import { scrapeTikTok } from './src/sources/tiktok.js';
+import { scrapeTwitter, scrapeTwitterProfile } from './src/sources/twitter.js';
+import { scrapeInstagram, scrapeInstagramProfile } from './src/sources/instagram.js';
+import { scrapeTikTok, scrapeTikTokProfile } from './src/sources/tiktok.js';
 import { scrapeFacebook } from './src/sources/facebook.js';
 import { scrapeLinkedIn } from './src/sources/linkedin.js';
 import { scrapeThreads } from './src/sources/threads.js';
 import { closeBrowser, SCREENSHOTS_DIR, ensureScreenshotsDir, isRecent } from './src/browser.js';
 import { sendWhatsApp } from './src/whatsapp.js';
 import { generateAISummary } from './src/aiSummary.js';
-import type { Mention, Comment, Etiquetado, Alert, ScanPayload } from './src/types.js';
+import type { Mention, Comment, Etiquetado, Alert, ScanPayload, ProfileScanResult, ProfileInfo, ProfilePost } from './src/types.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -43,6 +43,13 @@ let lastResult: ScanPayload | null = null;
 let lastError = '';
 let scanStartedAt = '';
 let stopRequested = false;
+
+// ─── Estado del escaneo de PERFIL de influencer — independiente del scan por
+// keyword de arriba, corre su propio job en paralelo sin bloquearse mutuamente. ──
+let profileStatus: ScanStatus = 'idle';
+let currentProfileHandle = '';
+let lastProfileResult: ProfileScanResult | null = null;
+let profileError = '';
 
 // Filtro de rango de fecha exacto — aplicado DESPUÉS de que los scrapers ya
 // buscaron con su ventana `days` habitual (que sigue usándose para acotar cuánto
@@ -200,6 +207,40 @@ function parseSearchTerms(raw: string, pills?: string[]): { base: string; extraT
   // Keep all original pills as extraTerms so scrapers can use @handle, #tag and phrases
   const extraTerms = [...handles, ...hashtags, ...rest];
   return { base, extraTerms };
+}
+
+// Términos de contexto (ej. "Colombia" agregado a una sigla ambigua como "ETB")
+// — solo los pills de texto plano que no sean el propio keyword base.
+function getContextTerms(baseKeyword: string, extraTerms: string[]): string[] {
+  return extraTerms.filter(t => !t.startsWith('@') && !t.startsWith('#') && t.toLowerCase() !== baseKeyword.toLowerCase());
+}
+
+// Filtro suave: cuando hay término(s) de contexto, se descarta contenido que
+// NI menciona ese contexto NI "suena" a español — esto tumba ruido como
+// tweets de coleccionistas de Pokémon (siempre en inglés) para siglas
+// ambiguas tipo "ETB", sin exigir que "Colombia" aparezca literal (la
+// mayoría de menciones reales de una marca colombiana no aclaran el país).
+function looksSpanish(text: string): boolean {
+  const t = (text || '').toLowerCase();
+  if (/[áéíóúñ¿¡]/.test(t)) return true;
+  const stop = [' de ', ' la ', ' el ', ' que ', ' en ', ' y ', ' los ', ' las ', ' con ', ' para ', ' por ', ' es ', ' una ', ' un ', ' mi ', ' me '];
+  return stop.some(w => t.includes(w));
+}
+
+function passesContext(text: string, contextTerms: string[]): boolean {
+  if (contextTerms.length === 0) return true;
+  const low = (text || '').toLowerCase();
+  if (contextTerms.some(ct => low.includes(ct.toLowerCase()))) return true;
+  return looksSpanish(text);
+}
+
+// Filtra mentions/comments por contexto y loguea cuántos se descartaron
+function filterByContext<T extends { text?: string }>(items: T[], contextTerms: string[], key: string, kind: string): T[] {
+  if (contextTerms.length === 0) return items;
+  const kept = items.filter(i => passesContext(i.text || '', contextTerms));
+  const dropped = items.length - kept.length;
+  if (dropped > 0) console.log(`[${key}] Filtro de contexto (${kind}): ${dropped} descartados (ni "${contextTerms.join('/')}" ni español)`);
+  return kept;
 }
 
 function applySentiment(items: (Mention | Comment)[]) {
@@ -370,11 +411,23 @@ async function runScan(keyword: string, pills?: string[], days = 30, exclusions:
       } as any;
     };
 
-    type Scraper = (kw: string, extra: string[], days: number) => Promise<{ mentions: Mention[]; comments: Comment[]; etiquetados?: Etiquetado[] }>;
+    // OJO: scrapeLinkedIn ya usa la posición 4 para "exclusions" (un array) —
+    // sinceDate/untilDate van en las posiciones 5 y 6 para no chocar con eso.
+    // Pasamos `undefined` explícito en la 4 porque el filtro de exclusions ya
+    // se aplica de forma centralizada más abajo en runScan, no por-scraper.
+    type Scraper = (kw: string, extra: string[], days: number, exclusions?: string[], sinceDate?: string, untilDate?: string) => Promise<{ mentions: Mention[]; comments: Comment[]; etiquetados?: Etiquetado[] }>;
+
+    const contextTerms = getContextTerms(baseKeyword, extraTerms);
 
     const runScraper = async (key: string, run: Scraper) => {
       try {
-        const { mentions, comments, etiquetados = [] } = await run(baseKeyword, extraTerms, days);
+        // Si el rango pedido termina en el pasado (no "hoy"), pasamos esas
+        // fechas para que el scraper (Twitter, Noticias) pueda buscar directo
+        // en esa ventana (until:/cdr: en vez de scrollear desde hoy hasta
+        // llegar, que gastaría el tope de resultados en contenido irrelevante).
+        let { mentions, comments, etiquetados = [] } = await run(baseKeyword, extraTerms, days, undefined, dateRange?.start, dateRange?.end);
+        mentions = filterByContext(mentions, contextTerms, key, 'menciones');
+        comments = filterByContext(comments, contextTerms, key, 'comentarios');
         allMentions.push(...mentions);
         allComments.push(...comments);
         allEtiquetados.push(...etiquetados);
@@ -386,45 +439,35 @@ async function runScan(keyword: string, pills?: string[], days = 30, exclusions:
       }
       completedPlatforms.push(key);
       publishPartial(false);
-
-      // Push parcial a MUSE después de cada plataforma (sin screenshots para reducir tamaño)
-      if (lastResult) {
-        const MUSE_URL = (process.env.MUSE_BACKEND_URL || 'https://muse-l81e.onrender.com').replace(/\/$/, '');
-        const partial = JSON.parse(JSON.stringify(lastResult, (k, v) => k === 'screenshot' ? undefined : v));
-        fetch(`${MUSE_URL}/api/agent/push`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(partial),
-          signal: AbortSignal.timeout(30000),
-        }).catch(() => {});
-      }
     };
 
     // Filtro de plataformas — si se pasaron plataformas seleccionadas, solo correr esas
     const active = selectedPlatforms.length > 0 ? selectedPlatforms : ['twitter','youtube','noticias','instagram','reddit','facebook','linkedin','threads','tiktok'];
-    const run = (key: string, scraper: Scraper) => active.includes(key) ? runScraper(key, scraper) : Promise.resolve();
 
-    // Ejecutar en 3 batches para evitar saturación de red/CPU/memoria.
-    // Entre cada batch se revisa stopRequested — si el usuario le dio "Detener",
-    // no se lanzan más batches (el actual ya fue interrumpido por closeBrowser()
-    // en el endpoint /stop, así que sus scrapers ya están fallando/retornando).
-    const b1 = [run('twitter', scrapeTwitter as Scraper), run('youtube', scrapeYouTube as Scraper), run('noticias', scrapeNews as Scraper)].filter(Boolean);
-    if (b1.length) { console.log('🔄 Batch 1: Twitter, YouTube, Noticias'); await Promise.all(b1); }
+    // Una plataforma a la vez, en secuencia — NO en paralelo. Correr varios
+    // scrapers Playwright a la vez (cada uno con su propio contexto/pestañas,
+    // Twitter llega a abrir 20+ pestañas para hilos) satura una máquina con
+    // poca RAM y el scan completo termina más lento e inestable que corriendo
+    // una por una. Cada scraper cierra su contexto en su propio `finally`
+    // (ctx.close()), así que la memoria sí se libera entre plataforma y plataforma.
+    const PLATFORM_ORDER: [string, Scraper][] = [
+      ['twitter', scrapeTwitter as Scraper],
+      ['youtube', scrapeYouTube as Scraper],
+      ['noticias', scrapeNews as Scraper],
+      ['instagram', scrapeInstagram as Scraper],
+      ['reddit', scrapeReddit as Scraper],
+      ['facebook', scrapeFacebook as Scraper],
+      ['linkedin', scrapeLinkedIn as Scraper],
+      ['threads', scrapeThreads as Scraper],
+      ['tiktok', scrapeTikTok as Scraper],
+    ];
 
-    if (!stopRequested) {
-      // Batch 2: redes sociales con sesión
-      const b2 = [run('instagram', scrapeInstagram as Scraper), run('reddit', scrapeReddit as Scraper)].filter(Boolean);
-      if (b2.length) { console.log('🔄 Batch 2: Instagram, Reddit'); await Promise.all(b2); }
+    for (const [key, scraper] of PLATFORM_ORDER) {
+      if (stopRequested) break;
+      if (!active.includes(key)) continue;
+      console.log(`🔄 ${key}`);
+      await runScraper(key, scraper);
     }
-
-    if (!stopRequested) {
-      // Batch 3: Facebook, LinkedIn, Threads
-      const b3 = [run('facebook', scrapeFacebook as Scraper), run('linkedin', scrapeLinkedIn as Scraper), run('threads', scrapeThreads as Scraper)].filter(Boolean);
-      if (b3.length) { console.log('🔄 Batch 3: Facebook, LinkedIn, Threads'); await Promise.all(b3); }
-    }
-
-    // Batch 4: TikTok al final
-    if (!stopRequested && active.includes('tiktok')) { console.log('🔄 Batch 4: TikTok'); await runScraper('tiktok', scrapeTikTok as Scraper); }
 
     if (stopRequested) {
       console.log('[Scan] Detenido manualmente por el usuario.');
@@ -522,7 +565,7 @@ async function runScan(keyword: string, pills?: string[], days = 30, exclusions:
       payload.aiSummary = aiSummary;
       payload.summary = aiSummary.resumen;
     } else {
-      // Fallback: resumen básico sin IA para que MUSE siempre tenga algo
+      // Fallback: resumen básico sin IA para que el payload siempre tenga algo
       payload.aiSummary = {
         resumen: `Escaneo de "${displayKeyword}": ${allMentions.length} menciones en ${Object.keys(platforms).join(', ')}. Sentimiento ${payload.sentimentLabel}.`,
         hitos: allMentions.slice(0, 3).map(m => `${m.platform}: ${m.text.slice(0, 80)}`),
@@ -553,24 +596,100 @@ async function runScan(keyword: string, pills?: string[], days = 30, exclusions:
     // Enviar al backend de Zalvaje (non-blocking)
     await postToBackend(payload).catch((e: any) => console.warn('[Backend] ⚠ No se pudo enviar:', e.message?.slice(0, 80)));
 
-    // ── Enviar a MUSE PRIMERO (sin screenshots para reducir tamaño, 60s timeout) ────
-    const MUSE_URL = process.env.MUSE_BACKEND_URL || 'https://muse-l81e.onrender.com';
-    const musePayload = JSON.parse(JSON.stringify(payload, (k, v) => k === 'screenshot' ? undefined : v));
-    await fetch(`${MUSE_URL}/api/agent/push`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(musePayload),
-      signal: AbortSignal.timeout(60000),
-    }).then(() => console.log('[MUSE] ✅ Resultados enviados a MUSE'))
-      .catch((e: Error) => console.warn('[MUSE] ⚠ No se pudo enviar a MUSE:', e.message));
-
-    // ── WhatsApp — solo después de que MUSE recibió los datos ────
+    // ── WhatsApp ────
     sendWhatsApp(dailyReport.slice(0, 860) + (dailyReport.length > 860 ? '…' : '')).catch(() => {});
 
   } catch (e: any) {
     status = 'error';
     lastError = e.message;
     console.error('[Scan] Error:', e.message);
+  } finally {
+    await closeBrowser();
+  }
+}
+
+// ─── Escaneo de PERFIL de influencer — visita el perfil propio en cada
+// plataforma seleccionada (no una búsqueda) y trae sus posts reales con
+// likes/comentarios/views/miniatura/link. Corre las plataformas en secuencia
+// (mismo motivo que runScan: no saturar una máquina con poca RAM) y publica
+// resultados parciales a medida que cada plataforma termina. ──────────────
+async function runProfileScan(handle: string, platforms: string[]): Promise<void> {
+  profileStatus = 'running';
+  currentProfileHandle = handle;
+  stopRequested = false;
+
+  console.log(`\n👤 Escaneando perfil: "${handle}" en [${platforms.join(', ')}]`);
+
+  try {
+    const profiles: ProfileInfo[] = [];
+    const allPosts: ProfilePost[] = [];
+
+    const publishPartial = () => {
+      const byPlatform: Record<string, { posts: number; likes: number; comments: number; views: number }> = {};
+      for (const p of allPosts) {
+        if (!byPlatform[p.platform]) byPlatform[p.platform] = { posts: 0, likes: 0, comments: 0, views: 0 };
+        const b = byPlatform[p.platform];
+        b.posts++; b.likes += p.likes || 0; b.comments += p.comments || 0; b.views += p.views || 0;
+      }
+      const totalLikes = allPosts.reduce((s, p) => s + (p.likes || 0), 0);
+      const totalComments = allPosts.reduce((s, p) => s + (p.comments || 0), 0);
+      const totalViews = allPosts.reduce((s, p) => s + (p.views || 0), 0);
+      const n = allPosts.length || 1;
+      // Engagement rate estándar: (likes+comentarios promedio) / seguidores.
+      // Antes dividía por "views", que en Instagram solo existe en reels/videos
+      // — un feed de fotos (la mayoría de las cuentas) siempre daba 0%.
+      const totalFollowers = profiles.reduce((s, p) => s + (p.followers || 0), 0);
+      const avgEngagementRate = totalFollowers > 0
+        ? (totalLikes / n + totalComments / n) / totalFollowers
+        : 0;
+
+      lastProfileResult = {
+        handle,
+        scannedAt: new Date().toISOString(),
+        profiles: [...profiles],
+        posts: [...allPosts].sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime()),
+        totals: {
+          posts: allPosts.length,
+          likes: totalLikes,
+          comments: totalComments,
+          views: totalViews,
+          avgLikes: Math.round(totalLikes / n),
+          avgComments: Math.round(totalComments / n),
+          avgEngagementRate: parseFloat((avgEngagementRate * 100).toFixed(2)),
+        },
+        byPlatform,
+      };
+    };
+
+    type ProfileScraper = (h: string, max?: number) => Promise<{ profile: ProfileInfo | null; posts: ProfilePost[] }>;
+    const SCRAPERS: Record<string, ProfileScraper> = {
+      twitter: scrapeTwitterProfile,
+      instagram: scrapeInstagramProfile,
+      tiktok: scrapeTikTokProfile,
+      youtube: scrapeYouTubeProfile,
+    };
+
+    for (const key of platforms) {
+      if (stopRequested) break;
+      const scraper = SCRAPERS[key];
+      if (!scraper) { console.warn(`[ProfileScan] Plataforma desconocida: ${key}`); continue; }
+      try {
+        const { profile, posts } = await scraper(handle, 12);
+        if (profile) profiles.push(profile);
+        allPosts.push(...posts);
+        console.log(`[ProfileScan] ${key} → ${posts.length} posts`);
+      } catch (e: any) {
+        console.error(`[ProfileScan] Error en ${key}:`, e.message?.slice(0, 100));
+      }
+      publishPartial();
+    }
+
+    profileStatus = 'done';
+    console.log(`[ProfileScan] Completo: ${allPosts.length} posts en ${profiles.length} plataformas`);
+  } catch (e: any) {
+    profileStatus = 'error';
+    profileError = e.message;
+    console.error('[ProfileScan] Error:', e.message);
   } finally {
     await closeBrowser();
   }
@@ -613,9 +732,8 @@ async function runScanPartial(keyword: string, pills?: string[], days = 7, exclu
     (prevSnapshot.etiquetados || []).forEach((e: any) => e.url && existingUrls.add(e.url));
   }
 
-  const MUSE_URL = (process.env.MUSE_BACKEND_URL || 'https://muse-l81e.onrender.com').replace(/\/$/, '');
-
-  // Construye y pushea el merge actual a MUSE (parcial o final)
+  // Construye el merge actual (parcial o final) y lo publica en lastResult
+  // para que el frontend lo vea via /results.
   const pushMerged = (isFinal: boolean) => {
     const byDateDesc = (a: any, b: any) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime();
 
@@ -680,20 +798,18 @@ async function runScanPartial(keyword: string, pills?: string[], days = 7, exclu
       _newMentions: dedupM.length,
       _newComments: dedupC.length,
     } as any;
-
-    const partialStripped = JSON.parse(JSON.stringify(lastResult, (k, v) => k === 'screenshot' ? undefined : v));
-    fetch(`${MUSE_URL}/api/agent/push`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(partialStripped), signal: AbortSignal.timeout(30000),
-    }).catch(() => {});
   };
+
+  const contextTerms = getContextTerms(baseKeyword, extraTerms);
 
   try {
     const selected = platforms.filter(p => SCRAPER_MAP[p]);
 
     for (const key of selected) {
       try {
-        const { mentions, comments, etiquetados = [] } = await SCRAPER_MAP[key](baseKeyword, extraTerms, days);
+        let { mentions, comments, etiquetados = [] } = await SCRAPER_MAP[key](baseKeyword, extraTerms, days);
+        mentions = filterByContext(mentions, contextTerms, key, 'menciones');
+        comments = filterByContext(comments, contextTerms, key, 'comentarios');
         newMentions.push(...mentions);
         newComments.push(...comments);
         newEtiquetados.push(...etiquetados);
@@ -743,15 +859,6 @@ async function runScanPartial(keyword: string, pills?: string[], days = 7, exclu
     (lastResult as any)._partial = false; // IA + dailyReport listos → frontend puede salir
     status = 'done';
 
-    // Push final a MUSE PRIMERO — sin screenshots, 60s timeout
-    const museEnrichPayload = JSON.parse(JSON.stringify(lastResult, (k, v) => k === 'screenshot' ? undefined : v));
-    await fetch(`${MUSE_URL}/api/agent/push`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(museEnrichPayload), signal: AbortSignal.timeout(60000),
-    }).then(() => console.log('[MUSE] ✅ Enriquecimiento enviado a MUSE'))
-      .catch(() => {});
-
-    // WhatsApp solo después de MUSE
     sendWhatsApp(enrichReport.slice(0, 860) + (enrichReport.length > 860 ? '…' : '')).catch(() => {});
 
   } catch (e: any) {
@@ -826,10 +933,10 @@ const server = http.createServer(async (req, res) => {
     // al rango exacto en runScan (inExactRange).
     const startDate: string | undefined = typeof b.startDate === 'string' && b.startDate ? b.startDate : undefined;
     const endDate: string | undefined = typeof b.endDate === 'string' && b.endDate ? b.endDate : undefined;
-    let days: number = typeof b.days === 'number' && b.days > 0 ? Math.min(b.days, 180) : 30;
+    let days: number = typeof b.days === 'number' && b.days > 0 ? Math.min(b.days, 3650) : 30;
     if (startDate) {
       const daysBack = Math.ceil((Date.now() - new Date(startDate).getTime()) / 86400000);
-      days = Math.min(Math.max(daysBack, 1), 180);
+      days = Math.min(Math.max(daysBack, 1), 3650);
     }
 
     if (status === 'running') {
@@ -849,19 +956,19 @@ const server = http.createServer(async (req, res) => {
       if (status === 'running') { status = 'error'; lastError = e.message; }
     });
 
-    return json(res, { queued: true, keyword, message: `Escaneando "${keyword}"… puede tardar hasta 20-30 min dependiendo del volumen. Los resultados aparecerán en MUSE automáticamente.` });
+    return json(res, { queued: true, keyword, message: `Escaneando "${keyword}"… puede tardar hasta 20-30 min dependiendo del volumen. Los resultados aparecerán en ZALVAJE automáticamente.` });
   }
 
   // POST /stop — interrumpe el escaneo en curso cerrando el browser (los scrapers
   // en vuelo fallan con "Target closed" y sus propios try/catch lo manejan).
   if (method === 'POST' && url === '/stop') {
-    if (status !== 'running') {
+    if (status !== 'running' && profileStatus !== 'running') {
       return json(res, { stopped: false, message: 'No hay ningún escaneo en curso.' });
     }
     stopRequested = true;
     await closeBrowser().catch(() => {});
-    status = 'error';
-    lastError = 'Escaneo detenido manualmente por el usuario.';
+    if (status === 'running') { status = 'error'; lastError = 'Escaneo detenido manualmente por el usuario.'; }
+    if (profileStatus === 'running') { profileStatus = 'error'; profileError = 'Escaneo detenido manualmente por el usuario.'; }
     console.log('[Server] Escaneo detenido manualmente.');
     return json(res, { stopped: true, message: 'Escaneo detenido.' });
   }
@@ -891,7 +998,7 @@ const server = http.createServer(async (req, res) => {
     const b = await body(req);
     const keyword    = (b.keyword || b.brand || '').trim();
     const pills: string[] = Array.isArray(b.pills) ? b.pills.map((p: string) => String(p).trim()).filter(Boolean) : [];
-    const days: number = typeof b.days === 'number' && b.days > 0 ? Math.min(b.days, 180) : 7;
+    const days: number = typeof b.days === 'number' && b.days > 0 ? Math.min(b.days, 3650) : 7;
     const exclusions: string[] = Array.isArray(b.exclusions) ? b.exclusions.map((e: string) => String(e).trim().toLowerCase().replace(/[@#]/g, '')).filter(Boolean) : [];
     const platforms: string[] = Array.isArray(b.platforms) ? b.platforms.map((p: string) => String(p).toLowerCase().trim()) : [];
     if (!keyword) return json(res, { error: 'keyword requerida' }, 400);
@@ -914,6 +1021,51 @@ const server = http.createServer(async (req, res) => {
     });
 
     return json(res, { queued: true, keyword, platforms, message: `Enriqueciendo "${keyword}" en ${platforms.join(', ')}… (${days}d)` });
+  }
+
+  // POST /scan-profile — visita el perfil PROPIO de un handle (no una búsqueda)
+  // y trae sus posts reales con likes/comentarios/views/miniatura/link.
+  if (method === 'POST' && url === '/scan-profile') {
+    const b = await body(req);
+    const handle = (b.handle || '').trim();
+    const platforms: string[] = Array.isArray(b.platforms) && b.platforms.length > 0
+      ? b.platforms.map((p: string) => String(p).toLowerCase().trim())
+      : ['twitter', 'instagram', 'tiktok', 'youtube'];
+    if (!handle) return json(res, { error: 'handle requerido' }, 400);
+
+    if (profileStatus === 'running') {
+      return json(res, { queued: false, message: `Ya hay un escaneo de perfil en curso: "${currentProfileHandle}". Espera que termine.` });
+    }
+    if (status === 'running') {
+      return json(res, { queued: false, message: 'Hay un escaneo por palabra clave en curso. Espera que termine antes de escanear un perfil (comparten el navegador).' });
+    }
+
+    const SCAN_TIMEOUT_MS = 20 * 60 * 1000; // un perfil (4 plataformas, ~12 posts c/u) es mucho más rápido que un scan por keyword
+    const scanTimeout = new Promise<void>((_, reject) =>
+      setTimeout(() => reject(new Error('Escaneo de perfil superó el límite de 20 minutos')), SCAN_TIMEOUT_MS)
+    );
+    Promise.race([runProfileScan(handle, platforms), scanTimeout]).catch(e => {
+      console.error('[Server] Scan-profile error:', e.message);
+      if (profileStatus === 'running') { profileStatus = 'error'; profileError = e.message; }
+    });
+
+    return json(res, { queued: true, handle, platforms, message: `Escaneando perfil de "${handle}"… puede tardar unos minutos.` });
+  }
+
+  // GET /profile-status
+  if (method === 'GET' && url === '/profile-status') {
+    return json(res, {
+      online: true,
+      status: profileStatus,
+      currentHandle: currentProfileHandle || null,
+      lastHandle: lastProfileResult?.handle || null,
+    });
+  }
+
+  // GET /profile-results
+  if (method === 'GET' && (url === '/profile-results' || url.startsWith('/profile-results?'))) {
+    if (!lastProfileResult) return json(res, { success: false, message: 'Sin resultados aún. Dispara un escaneo de perfil primero.' });
+    return json(res, { success: true, status: profileStatus, result: lastProfileResult });
   }
 
   // POST /clear-seen — resetea el historial de URLs vistas (para re-escanear todo desde cero)
@@ -986,6 +1138,25 @@ function startQuickTunnel() {
 
 // Re-registrar cada 6h mientras el proceso vive, por si el TTL del backend expira
 setInterval(() => { if (currentTunnelUrl) registerTunnelUrl(currentTunnelUrl); }, 6 * 60 * 60 * 1000);
+
+// ─── Auto-sanación del túnel — el fallo real observado en producción: cloudflared
+// puede quedar "vivo" (el proceso sigue corriendo, el evento 'exit' nunca dispara)
+// pero SORDO (la sesión con el edge de Cloudflare se cae, típicamente tras
+// suspender/reanudar el PC o cambiar de red) — nadie lo detecta desde adentro.
+// Antes dependíamos 100% del watchdog EXTERNO (cada 2 min, mata y relanza todo
+// el proceso). Este chequeo interno prueba el túnel cada 90s y, si no responde,
+// mata cloudflared directamente — el handler 'exit' ya existente lo relanza en
+// 5s con una URL nueva, sin esperar al ciclo completo del watchdog externo.
+setInterval(async () => {
+  if (!currentTunnelUrl || !tunnelProc) return;
+  try {
+    const res = await fetch(currentTunnelUrl, { signal: AbortSignal.timeout(8000) });
+    if (res.status > 0) return; // cualquier respuesta HTTP (incluso 401) = túnel vivo
+  } catch {
+    console.warn(`[Tunnel] ⚠️ Auto-chequeo: ${currentTunnelUrl} no responde — matando cloudflared para forzar reinicio...`);
+    tunnelProc.kill();
+  }
+}, 90 * 1000);
 
 // Sin timeout en el servidor — los scans pueden tardar hasta 2 horas
 server.timeout = 0;
