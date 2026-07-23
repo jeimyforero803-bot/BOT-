@@ -292,41 +292,59 @@ async function enrichFollowerCounts(ctx: any, mentions: Mention[]): Promise<void
   if (uniqueHandles.length === 0) return;
 
   console.log(`[Twitter] Enriqueciendo ${uniqueHandles.length} perfiles con seguidores...`);
-  const followerMap = new Map<string, number>();
+  const followerMap = new Map<string, { count: number; avatar?: string }>();
   for (const handle of uniqueHandles) {
     try {
       const pPage = await ctx.newPage();
       await pPage.goto(`https://twitter.com/${handle.replace('@', '')}`, { waitUntil: 'domcontentloaded', timeout: 20000 });
       await pPage.waitForSelector('a[href*="/followers"]', { timeout: 8000 }).catch(() => {});
-      const fRaw = await pPage.evaluate(() => {
+      const data = await pPage.evaluate(() => {
+        let fRaw: string | null = null;
         for (const link of Array.from(document.querySelectorAll('a[href*="/followers"], a[href*="/verified_followers"]'))) {
           for (const span of Array.from(link.querySelectorAll('span'))) {
             const t = span.textContent?.trim() || '';
-            if (t && /^[\d.,]+[KkMm]?$/.test(t)) return t;
+            if (t && /^[\d.,]+[KkMm]?$/.test(t)) { fRaw = t; break; }
+          }
+          if (fRaw) break;
+        }
+        if (!fRaw) {
+          for (const link of Array.from(document.querySelectorAll('a[href*="/followers"]'))) {
+            const aria = (link as HTMLElement).getAttribute('aria-label') || '';
+            const m = aria.match(/([\d.,]+[KkMm]?)\s*(follower|seguidor)/i);
+            if (m) { fRaw = m[1]; break; }
           }
         }
-        for (const link of Array.from(document.querySelectorAll('a[href*="/followers"]'))) {
-          const aria = (link as HTMLElement).getAttribute('aria-label') || '';
-          const m = aria.match(/([\d.,]+[KkMm]?)\s*(follower|seguidor)/i);
-          if (m) return m[1];
+        if (!fRaw) {
+          const allText = Array.from(document.querySelectorAll('[data-testid="UserProfileHeader_Items"] span, [data-testid="primaryColumn"] span'));
+          for (let i = 0; i < allText.length - 1; i++) {
+            const t = allText[i].textContent?.trim() || '';
+            const next = allText[i + 1]?.textContent?.trim().toLowerCase() || '';
+            if (/^[\d.,]+[KkMm]?$/.test(t) && (next.includes('follower') || next.includes('seguidor'))) { fRaw = t; break; }
+          }
         }
-        const allText = Array.from(document.querySelectorAll('[data-testid="UserProfileHeader_Items"] span, [data-testid="primaryColumn"] span'));
-        for (let i = 0; i < allText.length - 1; i++) {
-          const t = allText[i].textContent?.trim() || '';
-          const next = allText[i + 1]?.textContent?.trim().toLowerCase() || '';
-          if (/^[\d.,]+[KkMm]?$/.test(t) && (next.includes('follower') || next.includes('seguidor'))) return t;
-        }
-        return null;
+        // Foto de perfil — solo vale la pena capturarla acá (ya estamos en la
+        // página del perfil por el follower count); no se hace por cada mención.
+        const avatarEl = document.querySelector('a[href*="/photo"] img, [data-testid="UserAvatar-Container"] img') as HTMLImageElement | null;
+        return { fRaw, avatar: avatarEl?.src || undefined };
       });
-      if (fRaw) { const n = parseFC(fRaw); if (n > 0) followerMap.set(handle.toLowerCase(), n); }
+      if (data.fRaw) {
+        const n = parseFC(data.fRaw);
+        if (n > 0) followerMap.set(handle.toLowerCase(), { count: n, avatar: data.avatar });
+      }
       await pPage.close();
       await delay(1200);
     } catch { /* skip */ }
   }
   for (const m of mentions) {
     const h = (m.author.split(' ').find(p => p.startsWith('@')) || '').toLowerCase();
-    const fc = followerMap.get(h) ?? 0;
-    if (fc > 0) { (m as any).follower_count = fc; (m as any).is_influencer = fc >= 5000; }
+    const entry = followerMap.get(h);
+    const fc = entry?.count ?? 0;
+    if (fc > 0) {
+      (m as any).follower_count = fc;
+      (m as any).is_influencer = fc >= 5000;
+      // Miniatura de perfil solo para influencers relevantes — no para cualquier autor.
+      if (fc >= 5000 && entry?.avatar) (m as any).avatar = entry.avatar;
+    }
   }
   console.log(`[Twitter] Seguidores enriquecidos para ${followerMap.size} autores`);
 }

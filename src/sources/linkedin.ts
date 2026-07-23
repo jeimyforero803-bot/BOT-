@@ -561,7 +561,18 @@ export async function scrapeLinkedIn(keyword: string, extraTerms: string[] = [],
           });
           if (followersRaw) {
             const fc = parseFC(followersRaw);
-            if (fc > 0) { item.follower_count = fc; item.is_influencer = fc >= 5000; }
+            if (fc > 0) {
+              item.follower_count = fc;
+              item.is_influencer = fc >= 5000;
+              // Foto de perfil solo para influencers relevantes — ya estamos en su
+              // página por el conteo de seguidores, no cuesta una visita extra.
+              if (fc >= 5000) {
+                const avatar = await profPage.evaluate(() =>
+                  (document.querySelector('img.pv-top-card-profile-picture__image, img[class*="profile-photo"], .org-top-card-primary-content__logo img') as HTMLImageElement | null)?.src || ''
+                ).catch(() => '');
+                if (avatar) (item as any).avatar = avatar;
+              }
+            }
           }
           await profPage.close();
           await delay(800);

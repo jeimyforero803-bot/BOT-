@@ -9,6 +9,9 @@ export interface Mention {
   is_influencer?: boolean;
   follower_count?: number;
   screenshot?: string;
+  // Foto de perfil — solo se captura cuando is_influencer es true (ver
+  // enrichFollowerCounts en twitter.ts y equivalentes en youtube/linkedin/threads).
+  avatar?: string;
 }
 
 export interface Comment {

@@ -320,6 +320,14 @@ export async function scrapeYouTube(keyword: string, _extraTerms: string[] = [],
             if (vidMention) {
               (vidMention as any).follower_count = subCount;
               (vidMention as any).is_influencer = subCount >= 5000;
+              // Miniatura de canal solo si califica como influencer relevante —
+              // ya estamos en la página del video, así que no cuesta una visita extra.
+              if (subCount >= 5000) {
+                const channelAvatar = await vPage.evaluate(() =>
+                  (document.querySelector('#avatar img, yt-img-shadow#avatar img') as HTMLImageElement | null)?.src || ''
+                ).catch(() => '');
+                if (channelAvatar) (vidMention as any).avatar = channelAvatar;
+              }
             }
             console.log(`[YouTube] Canal "${vid.channel}" → ${subCount.toLocaleString()} suscriptores`);
           }
