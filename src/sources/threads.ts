@@ -118,7 +118,12 @@ async function extractReplies(page: any, mainText: string): Promise<{
   }, mainText);
 }
 
-export async function scrapeThreads(keyword: string, extraTerms: string[] = [], days = 30): Promise<{
+// Firma alineada a (kw, extra, days, exclusions, sinceDate, untilDate) del tipo
+// Scraper en server.ts. Threads no tiene un filtro de rango de fechas exacto en
+// su búsqueda pública (a diferencia de Twitter con until: o Google con cdr:),
+// así que sinceDate/untilDate no se usan para construir la query — el recorte
+// exacto ya lo aplica runScan centralmente con inExactRange sobre el resultado.
+export async function scrapeThreads(keyword: string, extraTerms: string[] = [], days = 30, _exclusions?: string[], _sinceDate?: string, _untilDate?: string): Promise<{
   mentions: Mention[]; comments: Comment[]; etiquetados: Etiquetado[];
 }> {
   const mentions: Mention[] = [];

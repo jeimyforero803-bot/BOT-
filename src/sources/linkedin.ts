@@ -90,10 +90,28 @@ async function extractPosts(page: any): Promise<{
         return h.includes('/feed/update/') || h.includes('activityUrn') ||
           (h.includes('/posts/') && (h.split('/posts/')[1] || '').length > 15);
       });
-      const url = postLink?.href || '';
+      let url = postLink?.href || '';
 
-      // Fecha: elemento <time> dentro del contenedor
+      // Fecha: elemento <time> dentro del contenedor. El timestamp ("2d", "1 sem")
+      // casi siempre está envuelto en el link real al post — si el paso de arriba
+      // no encontró nada, este suele ser el permalink correcto.
       const timeEl = container.querySelector('time');
+      if (!url) {
+        const timeLink = timeEl?.closest('a[href]') as HTMLAnchorElement | null;
+        if (timeLink?.href) url = timeLink.href;
+      }
+      // Último recurso: el propio contenedor (o un ancestro cercano) suele traer
+      // el ID de la actividad en un atributo data-urn aunque no haya <a> visible —
+      // con eso se puede construir el permalink canónico en vez de dejarlo vacío.
+      if (!url) {
+        let node: HTMLElement | null = container;
+        for (let i = 0; i < 5 && node; i++) {
+          const urn = node.getAttribute?.('data-urn') || node.getAttribute?.('data-id') || '';
+          const m = urn.match(/urn:li:activity:(\d+)/);
+          if (m) { url = `https://www.linkedin.com/feed/update/urn:li:activity:${m[1]}/`; break; }
+          node = node.parentElement;
+        }
+      }
       const date = timeEl?.getAttribute('datetime') || timeEl?.textContent?.trim() || '';
 
       // Likes: cualquier span/div con número cerca de íconos de reacción
@@ -189,7 +207,12 @@ async function extractComments(page: any): Promise<{
   });
 }
 
-export async function scrapeLinkedIn(keyword: string, extraTerms: string[] = [], days = 30, exclusions: string[] = []): Promise<{
+// Firma alineada a (kw, extra, days, exclusions, sinceDate, untilDate) del tipo
+// Scraper en server.ts. LinkedIn no expone un filtro de rango de fechas exacto
+// en su búsqueda pública (solo presets relativos: past-24h/past-week/past-month),
+// así que sinceDate/untilDate no se usan para construir la query — el recorte
+// exacto ya lo aplica runScan centralmente con inExactRange sobre el resultado.
+export async function scrapeLinkedIn(keyword: string, extraTerms: string[] = [], days = 30, exclusions: string[] = [], _sinceDate?: string, _untilDate?: string): Promise<{
   mentions: Mention[]; comments: Comment[]; etiquetados: Etiquetado[];
 }> {
   const mentions: Mention[] = [];
@@ -517,11 +540,17 @@ export async function scrapeLinkedIn(keyword: string, extraTerms: string[] = [],
 
       const shot = screenshotMap.get(post.text.slice(0, 50));
 
+      // OJO: antes caía a searchUrls[0] (la página genérica de resultados de
+      // búsqueda) cuando no se pudo extraer el link real del post — eso hacía
+      // que el usuario cayera en la página de búsqueda en vez del post real.
+      // Preferible el perfil del autor (al menos es relevante) o, si tampoco
+      // hay eso, dejarlo vacío — el frontend ya maneja bien la ausencia de link.
+      if (!post.url) console.warn(`[LinkedIn] Sin link de post extraído para "${post.author}" — usando fallback`);
       const item: any = {
         platform: 'linkedin',
         author: post.author,
         text: post.text.slice(0, 600),
-        url: post.url || searchUrls[0],
+        url: post.url || post.authorUrl || '',
         date: isoDate,
         likes: parseInt((post.likes || '').replace(/[^0-9]/g, '') || '0') || 0,
         tipo: 'post',
