@@ -349,7 +349,14 @@ async function enrichFollowerCounts(ctx: any, mentions: Mention[]): Promise<void
   console.log(`[Twitter] Seguidores enriquecidos para ${followerMap.size} autores`);
 }
 
-export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], days = 45, _exclusions?: string[], untilDate?: string): Promise<{
+// OJO: la firma debe respetar (kw, extra, days, exclusions, sinceDate, untilDate)
+// tal cual el tipo Scraper en server.ts — antes esta función solo declaraba 5
+// parámetros y llamaba "untilDate" a lo que en realidad llegaba en la posición
+// de sinceDate (la fecha "desde"), así que el filtro until: de Twitter se
+// aplicaba con la fecha de inicio en vez de la de fin. _sinceDate no se usa
+// directo en la query porque `days` (calculado en server.ts a partir de esa
+// misma fecha) ya acota el scroll hacia atrás lo suficiente.
+export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], days = 45, _exclusions?: string[], _sinceDate?: string, untilDate?: string): Promise<{
   mentions: Mention[]; comments: Comment[]; etiquetados: Etiquetado[];
 }> {
   let mentions: Mention[] = [];
