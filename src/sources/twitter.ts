@@ -10,8 +10,60 @@ import type { Mention, Comment, Etiquetado, ProfilePost, ProfileInfo } from '../
 type RawTweet = {
   author: string; handle: string; text: string; url: string;
   likes: string; retweets: string; replies: string;
-  isReply: boolean; date: string;
+  isReply: boolean; date: string; screenshot?: string;
 };
+
+// Captura pantallazos justo después de cada pasada de búsqueda, mientras esa
+// página sigue cargada — con bloques mensuales, `page` termina en el último
+// bloque buscado, así que capturar al final (como se hacía antes) desalinea
+// los índices con el DOM real de cada bloque.
+async function captureFirstScreenshots(page: any, tweetsMap: Map<string, RawTweet>, limit: number): Promise<void> {
+  if (limit <= 0) return;
+  const tweetEls = await page.$$('[data-testid="tweet"]');
+  const list = Array.from(tweetsMap.values());
+  for (let i = 0; i < Math.min(limit, list.length, tweetEls.length); i++) {
+    if (list[i].screenshot) continue;
+    const shot = await takeScreenshot(tweetEls[i], 'tw_tweet');
+    if (shot) list[i].screenshot = shot;
+  }
+}
+
+// Muestreo con paso fijo a través de toda la línea de tiempo (ordenada por
+// fecha) — evita que un recorte simple ([0, limit)) termine mostrando solo el
+// bloque más antiguo (o el más nuevo) cuando hay más resultados que el tope.
+function sampleAcrossRange<T extends { date: string }>(items: T[], limit: number): T[] {
+  const sorted = [...items].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+  if (sorted.length <= limit) return sorted;
+  const step = sorted.length / limit;
+  const out: T[] = [];
+  for (let i = 0; i < limit; i++) out.push(sorted[Math.floor(i * step)]);
+  return out;
+}
+
+function addDaysISO(dateStr: string, n: number): string {
+  const d = new Date(dateStr + 'T00:00:00');
+  d.setDate(d.getDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+// Divide [start, end] en bloques mensuales — cada bloque tiene su PROPIO tope
+// de 300 tweets/60 pasadas de scroll (ver searchAndScrollTweets). Sin esto, un
+// rango largo (ej. 7 meses) con volumen alto de tweets recientes agotaba el
+// tope entero scrolleando solo el mes más reciente y nunca llegaba a los meses
+// de atrás — el usuario pedía "desde enero hasta hoy" y solo recibía el último mes.
+function buildMonthChunks(startStr: string, endStr: string, maxChunks = 12): { start: string; end: string }[] {
+  const chunks: { start: string; end: string }[] = [];
+  let cursor = startStr;
+  const endD = new Date(endStr + 'T00:00:00').getTime();
+  while (new Date(cursor + 'T00:00:00').getTime() <= endD && chunks.length < maxChunks) {
+    const cursorD = new Date(cursor + 'T00:00:00');
+    const monthEndD = new Date(cursorD.getFullYear(), cursorD.getMonth() + 1, 0);
+    const chunkEnd = monthEndD.getTime() < endD ? monthEndD.toISOString().slice(0, 10) : endStr;
+    chunks.push({ start: cursor, end: chunkEnd });
+    cursor = addDaysISO(chunkEnd, 1);
+  }
+  return chunks;
+}
 
 /**
  * Busca "query" en X y scrollea hasta que el tweet más viejo visto cruce
@@ -353,10 +405,8 @@ async function enrichFollowerCounts(ctx: any, mentions: Mention[]): Promise<void
 // tal cual el tipo Scraper en server.ts — antes esta función solo declaraba 5
 // parámetros y llamaba "untilDate" a lo que en realidad llegaba en la posición
 // de sinceDate (la fecha "desde"), así que el filtro until: de Twitter se
-// aplicaba con la fecha de inicio en vez de la de fin. _sinceDate no se usa
-// directo en la query porque `days` (calculado en server.ts a partir de esa
-// misma fecha) ya acota el scroll hacia atrás lo suficiente.
-export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], days = 45, _exclusions?: string[], _sinceDate?: string, untilDate?: string): Promise<{
+// aplicaba con la fecha de inicio en vez de la de fin.
+export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], days = 45, _exclusions?: string[], sinceDate?: string, untilDate?: string): Promise<{
   mentions: Mention[]; comments: Comment[]; etiquetados: Etiquetado[];
 }> {
   let mentions: Mention[] = [];
@@ -378,18 +428,49 @@ export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], 
       const handle = extraTerms.find(t => t.startsWith('@'));
       const baseQuery = handle || buildPreciseQuery(keyword, extraTerms);
 
-      // Si el rango pedido termina en el pasado (no "hoy"), usamos until: para
-      // que X arranque la búsqueda directo ahí — si no, el scroll parte desde
-      // hoy y gasta el tope de tweets en contenido reciente que de todos modos
-      // se iba a descartar por estar fuera del rango pedido.
-      const isPastEnd = untilDate && (Date.now() - new Date(untilDate).getTime()) > 2 * 86400000;
-      const preciseQuery = isPastEnd ? `${baseQuery} until:${untilDate}` : baseQuery;
-      console.log(`[Twitter] Búsqueda precisa: ${preciseQuery}`);
+      // Rangos largos (>35 días) con volumen alto de tweets recientes agotaban
+      // el tope de 300/60 pasadas scrolleando solo el mes más reciente y nunca
+      // llegaban a "sinceDate" — se divide en bloques mensuales, cada uno con
+      // su propio tope, para garantizar cobertura de TODO el rango pedido.
+      const effectiveUntil = untilDate || new Date().toISOString().slice(0, 10);
+      const allTweets = new Map<string, RawTweet>();
+      if (sinceDate && days > 35) {
+        const chunks = buildMonthChunks(sinceDate, effectiveUntil);
+        const shotsPerChunk = Math.max(1, Math.floor(10 / chunks.length));
+        console.log(`[Twitter] Rango de ${days} días (${sinceDate} → ${effectiveUntil}) — dividiendo en ${chunks.length} bloque(s) mensual(es) para cubrir todo el rango`);
+        for (const chunk of chunks) {
+          const chunkQuery = `${baseQuery} since:${chunk.start} until:${addDaysISO(chunk.end, 1)}`;
+          console.log(`[Twitter] Bloque ${chunk.start} → ${chunk.end}: ${chunkQuery}`);
+          try {
+            const chunkTweets = await searchAndScrollTweets(page, chunkQuery, new Date(chunk.start + 'T00:00:00').getTime());
+            await captureFirstScreenshots(page, chunkTweets, shotsPerChunk);
+            for (const [url, t] of chunkTweets) allTweets.set(url, t);
+          } catch (e: any) {
+            console.warn(`[Twitter] Error en bloque ${chunk.start}→${chunk.end}:`, e.message?.slice(0, 80));
+          }
+          await humanDelay(1500, 2500);
+        }
+      } else {
+        // Si el rango pedido termina en el pasado (no "hoy"), usamos until: para
+        // que X arranque la búsqueda directo ahí — si no, el scroll parte desde
+        // hoy y gasta el tope de tweets en contenido reciente que de todos modos
+        // se iba a descartar por estar fuera del rango pedido.
+        const isPastEnd = untilDate && (Date.now() - new Date(untilDate).getTime()) > 2 * 86400000;
+        const preciseQuery = isPastEnd ? `${baseQuery} until:${untilDate}` : baseQuery;
+        console.log(`[Twitter] Búsqueda precisa: ${preciseQuery}`);
 
-      const targetStartMs = Date.now() - days * 86400000;
-      const allTweets = await searchAndScrollTweets(page, preciseQuery, targetStartMs);
+        const targetStartMs = Date.now() - days * 86400000;
+        const singlePass = await searchAndScrollTweets(page, preciseQuery, targetStartMs);
+        await captureFirstScreenshots(page, singlePass, 10);
+        for (const [url, t] of singlePass) allTweets.set(url, t);
+      }
 
-      const tweets = Array.from(allTweets.values()).slice(0, 300);
+      // Con rangos largos se prioriza cubrir TODO el período pedido en vez de
+      // solo los primeros 300 en orden de inserción (que serían los del bloque
+      // más antiguo) — se muestrea proporcionalmente por bloque de tiempo si
+      // hay más de 300 tweets acumulados entre todos los meses.
+      const allTweetsList = Array.from(allTweets.values());
+      const tweets = allTweetsList.length <= 300 ? allTweetsList : sampleAcrossRange(allTweetsList, 300);
       console.log(`[Twitter] Total: ${tweets.length} tweets únicos`);
 
       // Ancla "ahora" a la fecha real más reciente vista en el scrape, no al
@@ -398,14 +479,14 @@ export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], 
       // como "viejo" y la búsqueda vuelve 0 resultados aunque sí haya tweets recientes.
       const referenceNow = getBatchReferenceNow(tweets.map(t => t.date));
 
-      const tweetEls = await page.$$('[data-testid="tweet"]');
-
       for (let i = 0; i < tweets.length; i++) {
         const t = tweets[i];
         if (!isRecent(t.date, days, referenceNow)) continue;
 
-        let screenshot: string | undefined;
-        if (i < 10 && tweetEls[i]) screenshot = await takeScreenshot(tweetEls[i], 'tw_tweet');
+        // El pantallazo ya se capturó justo después de cada búsqueda (ver
+        // captureFirstScreenshots) — hacerlo acá con el DOM actual desalineaba
+        // los índices en cuanto hubo más de una pasada/bloque de búsqueda.
+        const screenshot = t.screenshot;
 
         const item: any = {
           platform: 'twitter',
