@@ -17,14 +17,35 @@ type RawTweet = {
 // página sigue cargada — con bloques mensuales, `page` termina en el último
 // bloque buscado, así que capturar al final (como se hacía antes) desalinea
 // los índices con el DOM real de cada bloque.
+//
+// Solo vale la pena el pantallazo en los de MAYOR impacto (más likes) — el
+// resto ya queda cubierto con su link, no hace falta capturarlos todos y eso
+// ahorra tiempo de scan. Se prioriza por likes en vez de tomar los primeros
+// N en orden de aparición, y se matchea el elemento del DOM por la URL del
+// tweet (no por posición) porque el orden de inserción no necesariamente
+// coincide con el orden actual en pantalla tras varias pasadas de scroll.
 async function captureFirstScreenshots(page: any, tweetsMap: Map<string, RawTweet>, limit: number): Promise<void> {
   if (limit <= 0) return;
+  const candidates = Array.from(tweetsMap.values())
+    .filter(t => !t.screenshot)
+    .sort((a, b) => parseEngagementCount(b.likes) - parseEngagementCount(a.likes))
+    .slice(0, limit);
+  if (candidates.length === 0) return;
+
   const tweetEls = await page.$$('[data-testid="tweet"]');
-  const list = Array.from(tweetsMap.values());
-  for (let i = 0; i < Math.min(limit, list.length, tweetEls.length); i++) {
-    if (list[i].screenshot) continue;
-    const shot = await takeScreenshot(tweetEls[i], 'tw_tweet');
-    if (shot) list[i].screenshot = shot;
+  const elIndexByUrl = new Map<string, number>();
+  for (let i = 0; i < tweetEls.length; i++) {
+    const url: string = await tweetEls[i].evaluate((node: Element) =>
+      (node.querySelector('a[href*="/status/"]') as HTMLAnchorElement | null)?.href || ''
+    ).catch(() => '');
+    if (url && !elIndexByUrl.has(url)) elIndexByUrl.set(url, i);
+  }
+
+  for (const t of candidates) {
+    const idx = elIndexByUrl.get(t.url);
+    if (idx === undefined) continue;
+    const shot = await takeScreenshot(tweetEls[idx], 'tw_tweet');
+    if (shot) t.screenshot = shot;
   }
 }
 
