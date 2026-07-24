@@ -381,8 +381,12 @@ async function runScan(keyword: string, pills?: string[], days = 30, exclusions:
     const platforms: Record<string, { mentions: number; comments: number; etiquetados: number }> = {};
     const completedPlatforms: string[] = [];
 
-    // Publica resultado parcial en lastResult para que el frontend lo vea en tiempo real
-    const publishPartial = (final: boolean) => {
+    // Publica resultado parcial en lastResult para que el frontend lo vea en tiempo real.
+    // `note` es para progreso DENTRO de una sola plataforma que tarda mucho (ej. Twitter
+    // buscando por bloques mensuales) — sin esto, el frontend no tiene nada nuevo que
+    // mostrar entre el inicio de una plataforma y su finalización completa, aunque haya
+    // progreso real ocurriendo (bloque 3/7, bloque 4/7, etc.).
+    const publishPartial = (final: boolean, note?: string) => {
       applySentiment(allMentions);
       applySentiment(allComments);
       const scores = [...allMentions, ...allComments].map(i => (i as any).sentiment_score || 0);
@@ -405,7 +409,7 @@ async function runScan(keyword: string, pills?: string[], days = 30, exclusions:
         influencers, alerts, keywords: kws,
         summary: final
           ? `Escaneo de "${displayKeyword}": ${allMentions.length} menciones, ${allComments.length} comentarios, ${allEtiquetados.length} etiquetados. Sentimiento ${sentimentLabel}.`
-          : `Escaneando "${displayKeyword}"… ${completedPlatforms.length}/9 fuentes listas · ${allMentions.length} menciones encontradas.`,
+          : note || `Escaneando "${displayKeyword}"… ${completedPlatforms.length}/9 fuentes listas · ${allMentions.length} menciones encontradas.`,
         _partial: !final,
         _completedPlatforms: [...completedPlatforms],
       } as any;
@@ -415,7 +419,12 @@ async function runScan(keyword: string, pills?: string[], days = 30, exclusions:
     // sinceDate/untilDate van en las posiciones 5 y 6 para no chocar con eso.
     // Pasamos `undefined` explícito en la 4 porque el filtro de exclusions ya
     // se aplica de forma centralizada más abajo en runScan, no por-scraper.
-    type Scraper = (kw: string, extra: string[], days: number, exclusions?: string[], sinceDate?: string, untilDate?: string) => Promise<{ mentions: Mention[]; comments: Comment[]; etiquetados?: Etiquetado[] }>;
+    // Posiciones 7/8 (onChunkProgress/shouldStop) solo las usa Twitter, que
+    // divide búsquedas de rango largo en bloques mensuales — cada bloque puede
+    // tardar minutos, así que sin esto el frontend no ve NADA nuevo entre el
+    // inicio de Twitter y su finalización completa (podían ser 20-40 min en
+    // silencio), y /stop no interrumpía un escaneo a mitad de sus bloques.
+    type Scraper = (kw: string, extra: string[], days: number, exclusions?: string[], sinceDate?: string, untilDate?: string, onChunkProgress?: (note: string) => void, shouldStop?: () => boolean) => Promise<{ mentions: Mention[]; comments: Comment[]; etiquetados?: Etiquetado[] }>;
 
     const contextTerms = getContextTerms(baseKeyword, extraTerms);
 
@@ -425,7 +434,9 @@ async function runScan(keyword: string, pills?: string[], days = 30, exclusions:
         // fechas para que el scraper (Twitter, Noticias) pueda buscar directo
         // en esa ventana (until:/cdr: en vez de scrollear desde hoy hasta
         // llegar, que gastaría el tope de resultados en contenido irrelevante).
-        let { mentions, comments, etiquetados = [] } = await run(baseKeyword, extraTerms, days, undefined, dateRange?.start, dateRange?.end);
+        const onChunkProgress = key === 'twitter' ? (note: string) => publishPartial(false, note) : undefined;
+        const shouldStop = () => stopRequested;
+        let { mentions, comments, etiquetados = [] } = await run(baseKeyword, extraTerms, days, undefined, dateRange?.start, dateRange?.end, onChunkProgress, shouldStop);
         mentions = filterByContext(mentions, contextTerms, key, 'menciones');
         comments = filterByContext(comments, contextTerms, key, 'comentarios');
         allMentions.push(...mentions);

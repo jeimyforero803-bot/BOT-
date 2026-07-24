@@ -427,7 +427,7 @@ async function enrichFollowerCounts(ctx: any, mentions: Mention[]): Promise<void
 // parámetros y llamaba "untilDate" a lo que en realidad llegaba en la posición
 // de sinceDate (la fecha "desde"), así que el filtro until: de Twitter se
 // aplicaba con la fecha de inicio en vez de la de fin.
-export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], days = 45, _exclusions?: string[], sinceDate?: string, untilDate?: string): Promise<{
+export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], days = 45, _exclusions?: string[], sinceDate?: string, untilDate?: string, onChunkProgress?: (note: string) => void, shouldStop?: () => boolean): Promise<{
   mentions: Mention[]; comments: Comment[]; etiquetados: Etiquetado[];
 }> {
   let mentions: Mention[] = [];
@@ -459,9 +459,16 @@ export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], 
         const chunks = buildMonthChunks(sinceDate, effectiveUntil);
         const shotsPerChunk = Math.max(1, Math.floor(10 / chunks.length));
         console.log(`[Twitter] Rango de ${days} días (${sinceDate} → ${effectiveUntil}) — dividiendo en ${chunks.length} bloque(s) mensual(es) para cubrir todo el rango`);
-        for (const chunk of chunks) {
+        for (let ci = 0; ci < chunks.length; ci++) {
+          const chunk = chunks[ci];
+          // Antes /stop solo se revisaba ENTRE plataformas — un scan cancelado
+          // a mitad de Twitter seguía intentando TODOS los bloques restantes
+          // (cada uno fallando rápido con la página cerrada, pero igual tardando)
+          // en vez de cortar de inmediato.
+          if (shouldStop?.()) { console.log('[Twitter] Detenido por el usuario, abortando bloques restantes.'); break; }
           const chunkQuery = `${baseQuery} since:${chunk.start} until:${addDaysISO(chunk.end, 1)}`;
           console.log(`[Twitter] Bloque ${chunk.start} → ${chunk.end}: ${chunkQuery}`);
+          onChunkProgress?.(`Twitter: bloque ${ci + 1}/${chunks.length} (${chunk.start} → ${chunk.end}) — ${allTweets.size} tweets acumulados`);
           try {
             const chunkTweets = await searchAndScrollTweets(page, chunkQuery, new Date(chunk.start + 'T00:00:00').getTime());
             await captureFirstScreenshots(page, chunkTweets, shotsPerChunk);
@@ -469,6 +476,7 @@ export async function scrapeTwitter(keyword: string, extraTerms: string[] = [], 
           } catch (e: any) {
             console.warn(`[Twitter] Error en bloque ${chunk.start}→${chunk.end}:`, e.message?.slice(0, 80));
           }
+          onChunkProgress?.(`Twitter: bloque ${ci + 1}/${chunks.length} completo (${chunk.start} → ${chunk.end}) — ${allTweets.size} tweets acumulados`);
           await humanDelay(1500, 2500);
         }
       } else {
