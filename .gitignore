@@ -25,3 +25,7 @@ Thumbs.db
 
 # Runtime logs
 *.log
+
+# Capturas de prueba de los scrapers de bibliotecas
+pruebas-ads/
+agente.log

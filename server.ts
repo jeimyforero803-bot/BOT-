@@ -23,6 +23,7 @@ import { scrapeFacebook } from './src/sources/facebook.js';
 import { scrapeLinkedIn } from './src/sources/linkedin.js';
 import { scrapeThreads } from './src/sources/threads.js';
 import { closeBrowser, SCREENSHOTS_DIR, ensureScreenshotsDir, isRecent } from './src/browser.js';
+import { capturarBibliotecas, TOPE_POR_DEFECTO, type ObjetivoMarca, type ResumenBiblioteca } from './src/adsLibrary.js';
 import { sendWhatsApp } from './src/whatsapp.js';
 import { generateAISummary } from './src/aiSummary.js';
 import type { Mention, Comment, Etiquetado, Alert, ScanPayload, ProfileScanResult, ProfileInfo, ProfilePost } from './src/types.js';
@@ -903,6 +904,11 @@ function body(req: http.IncomingMessage): Promise<any> {
   });
 }
 
+let adsEstado: {
+  corriendo: boolean; marcas: string[]; iniciado: string | null; terminado: string | null;
+  resumen: ResumenBiblioteca[]; enviadas: number; intentadas: number; deposito: string | null; error: string | null;
+} = { corriendo: false, marcas: [], iniciado: null, terminado: null, resumen: [], enviadas: 0, intentadas: 0, deposito: null, error: null };
+
 const server = http.createServer(async (req, res) => {
   const url = req.url || '/';
   const method = req.method || 'GET';
@@ -928,6 +934,59 @@ const server = http.createServer(async (req, res) => {
       totalMentions: lastResult?.totalMentions ?? 0,
       version: '1.0',
     });
+  }
+
+
+  // ── BIBLIOTECAS DE ANUNCIOS (Meta + Google) ────────────────────────────────
+  // Se dispara desde el dashboard. Corre acá porque Render arranca con
+  // --max-old-space-size=430 y Chromium no entra en ese presupuesto.
+  // GET /ads-status — el frontend consulta el progreso sin bloquearse.
+  if (method === 'GET' && url === '/ads-status') {
+    return json(res, {
+      corriendo: adsEstado.corriendo,
+      marcas: adsEstado.marcas,
+      iniciado: adsEstado.iniciado,
+      terminado: adsEstado.terminado,
+      resumen: adsEstado.resumen,
+      enviadas: adsEstado.enviadas,
+      intentadas: adsEstado.intentadas,
+      deposito: adsEstado.deposito,
+      error: adsEstado.error,
+    });
+  }
+
+  // POST /ads-capture { objetivos: [{marca, dominio}] }
+  // Responde de inmediato: la captura tarda minutos y el HTTP no debe colgarse.
+  if (method === 'POST' && url === '/ads-capture') {
+    if (adsEstado.corriendo) {
+      return json(res, { error: 'ya hay una captura en curso', marcas: adsEstado.marcas }, 409);
+    }
+    const b = await body(req);
+    const objetivos: ObjetivoMarca[] = Array.isArray(b?.objetivos) ? b.objetivos : [];
+    if (!objetivos.length) return json(res, { error: 'se esperaba { objetivos: [{marca, dominio}] }' }, 400);
+
+    adsEstado = {
+      corriendo: true,
+      marcas: objetivos.map(o => o.marca),
+      iniciado: new Date().toISOString(),
+      terminado: null, resumen: [], enviadas: 0, error: null,
+    };
+
+    capturarBibliotecas(objetivos, { maxPorPlataforma: Number(b?.maxPorPlataforma) || TOPE_POR_DEFECTO })
+      .then(r => {
+        adsEstado.resumen = r.resumen;
+        adsEstado.enviadas = r.enviadas;
+        adsEstado.intentadas = r.intentadas;
+        adsEstado.deposito = r.deposito;
+        // Si el depósito falló, se marca como error: antes quedaba como éxito
+        // con la tabla vacía.
+        if (r.deposito.startsWith('FALLO')) adsEstado.error = `No se guardaron: ${r.deposito}`;
+        console.log(`[ads] captura lista: ${r.enviadas}/${r.intentadas} guardadas — ${r.deposito}`);
+      })
+      .catch(e => { adsEstado.error = e.message; console.error('[ads] fallo:', e.message); })
+      .finally(() => { adsEstado.corriendo = false; adsEstado.terminado = new Date().toISOString(); });
+
+    return json(res, { aceptado: true, marcas: adsEstado.marcas });
   }
 
   // POST /scan
