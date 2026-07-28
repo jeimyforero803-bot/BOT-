@@ -49,6 +49,9 @@ export interface ResultadoMeta {
     total: number;
     anuncios: AnuncioMeta[];
     anunciantesEncontrados: Array<{ nombre: string; paginaUrl: string; anuncios: number; confianza: string; aceptado: boolean }>;
+    /** Página a la que se ancló la consulta. Fijala en PAGINAS_META para que
+     *  la próxima corrida no dependa del buscador. */
+    paginaResuelta: { pageId: string; nombre: string; origen: string } | null;
     urlConsultada: string;
     diagnostico: string[];
 }
@@ -122,6 +125,35 @@ const construirUrl = (marca: string, pais: string, soloActivos: boolean) =>
         search_type: 'keyword_unordered',
         media_type: 'all',
     })}`;
+
+/**
+ * URL anclada a una página concreta. Es el modo PREFERIDO.
+ *
+ * La búsqueda por palabra clave ordena por relevancia de Meta, no por marca:
+ * "Banco Popular" devuelve ~450 resultados encabezados por Bonka, cursos de
+ * K-pop y Club Plateado, y los anuncios reales quedan enterrados donde el
+ * scroll infinito ya no carga. Anclando al page_id se va directo al
+ * repertorio de esa página, sin competir contra el ruido.
+ */
+const construirUrlPagina = (pageId: string, pais: string, soloActivos: boolean) =>
+    `${URL_BASE}?${new URLSearchParams({
+        active_status: soloActivos ? 'active' : 'all',
+        ad_type: 'all',
+        country: pais,
+        view_all_page_id: pageId,
+        search_type: 'page',
+        media_type: 'all',
+    })}`;
+
+/**
+ * Páginas conocidas, para marcas cuyo nombre es palabra común y que por eso
+ * nunca aparecen en la búsqueda por keyword. Se completa sola: cuando el
+ * scraper resuelve un page_id lo devuelve en `paginaResuelta` para poder
+ * fijarlo acá y no volver a depender del buscador.
+ */
+export const PAGINAS_META: Record<string, string> = {
+    'etb': '234370136617753',
+};
 
 async function cerrarCookies(page: Page, diag: string[]): Promise<void> {
     for (const t of ['Permitir todas las cookies', 'Allow all cookies', 'Rechazar cookies opcionales']) {
@@ -212,7 +244,14 @@ const EXTRAER_TARJETAS = () => {
 
 export async function scrapeMetaAds(
     marca: string,
-    opciones: { pais?: string; maxAnuncios?: number; minConfianza?: AnuncioMeta['confianza']; soloActivos?: boolean } = {},
+    opciones: {
+        pais?: string;
+        maxAnuncios?: number;
+        minConfianza?: AnuncioMeta['confianza'];
+        soloActivos?: boolean;
+        /** Fuerza el anclaje a esta página y saltea la búsqueda por keyword. */
+        pageId?: string;
+    } = {},
 ): Promise<ResultadoMeta> {
     const { pais = 'CO', maxAnuncios = 30, minConfianza = 'media', soloActivos = true } = opciones;
     const diag: string[] = [];
@@ -223,6 +262,13 @@ export async function scrapeMetaAds(
     const orden: Record<AnuncioMeta['confianza'], number> = { exacta: 3, alta: 2, media: 1, baja: 0 };
     let crudos: any[] = [];
 
+    // El page_id explícito manda; si no, se busca en el mapa conocido; si
+    // tampoco, se intenta resolver desde la propia búsqueda.
+    let pageIdForzado: string | undefined = opciones.pageId || PAGINAS_META[marca.toLowerCase().trim()];
+    let paginaResuelta: { pageId: string; nombre: string; origen: string } | null =
+        pageIdForzado ? { pageId: pageIdForzado, nombre: marca, origen: opciones.pageId ? 'parámetro' : 'mapa conocido' } : null;
+    if (pageIdForzado) diag.push(`page_id ${paginaResuelta!.origen}: ${pageIdForzado}`);
+
     try {
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
         await humanDelay(2500, 4000);
@@ -232,6 +278,50 @@ export async function scrapeMetaAds(
             const c = await page.locator('text=/~?\\s*[\\d.,]+\\s+resultados?/i').first().textContent({ timeout: 12000 });
             diag.push(`contador: ${c?.trim()}`);
         } catch { diag.push('contador no visible'); }
+
+        // ── Anclaje a página (modo preferido) ────────────────────────────────
+        // Si conocemos —o logramos resolver— el page_id de la marca, se abandona
+        // la búsqueda por keyword y se va directo al repertorio de esa página.
+        if (!pageIdForzado) {
+            await page.evaluate(() => window.scrollTo({ top: 800 }));
+            await delay(2200);
+            // Meta deja los pares nombre/id en el JSON embebido del documento.
+            const candidatos = await page.evaluate(() => {
+                const html = document.documentElement.innerHTML;
+                const vistos = new Map<string, string>();
+                const re = /"page_id"\s*:\s*"?(\d{6,})"?[^}]{0,400}?"page_name"\s*:\s*"([^"]{2,80})"/g;
+                let m: RegExpExecArray | null;
+                while ((m = re.exec(html))) if (!vistos.has(m[2])) vistos.set(m[2], m[1]);
+                // Orden inverso: a veces el nombre precede al id.
+                const re2 = /"page_name"\s*:\s*"([^"]{2,80})"[^}]{0,400}?"page_id"\s*:\s*"?(\d{6,})"?/g;
+                while ((m = re2.exec(html))) if (!vistos.has(m[1])) vistos.set(m[1], m[2]);
+                return [...vistos.entries()].map(([nombre, id]) => ({ nombre, id }));
+            });
+
+            const conConfianza = candidatos
+                .map(c => ({ ...c, conf: evaluarConfianza(c.nombre, '', marca) }))
+                .filter(c => orden[c.conf] >= orden['media'])
+                .sort((a, b) => orden[b.conf] - orden[a.conf]);
+
+            if (conConfianza.length) {
+                pageIdForzado = conConfianza[0].id;
+                paginaResuelta = { pageId: conConfianza[0].id, nombre: conConfianza[0].nombre, origen: 'resuelto en la búsqueda' };
+                diag.push(`page_id resuelto: ${conConfianza[0].nombre} = ${conConfianza[0].id} (${conConfianza[0].conf})`);
+            } else {
+                diag.push(`no se pudo resolver page_id entre ${candidatos.length} candidatos — se sigue por keyword`);
+            }
+        }
+
+        if (pageIdForzado) {
+            const urlPagina = construirUrlPagina(pageIdForzado, pais, soloActivos);
+            diag.push(`modo página: ${urlPagina}`);
+            await page.goto(urlPagina, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await humanDelay(2500, 4000);
+            try {
+                const c = await page.locator('text=/~?\\s*[\\d.,]+\\s+resultados?/i').first().textContent({ timeout: 10000 });
+                diag.push(`resultados de la página: ${c?.trim()}`);
+            } catch { /* sin contador */ }
+        }
 
         /**
          * Extracción incremental.
@@ -376,7 +466,8 @@ export async function scrapeMetaAds(
         total: anuncios.length,
         anuncios,
         anunciantesEncontrados: [...porAnunciante.values()].sort((a, b) => b.anuncios - a.anuncios),
-        urlConsultada: url,
+        paginaResuelta,
+        urlConsultada: pageIdForzado ? construirUrlPagina(pageIdForzado, pais, soloActivos) : url,
         diagnostico: diag,
     };
 }
